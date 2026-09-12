@@ -362,6 +362,7 @@ fn touch_indicator(m: &PanelModel) -> Option<View<Msg>> {
     if !m.taskbar.touch_active {
         return None;
     }
+    // u64::MAX key: reserved sentinel avoiding collision with real touch-point ids, which are small wire slots.
     Some(button("touch").key(u64::MAX).id("touch").class("active"))
 }
 
