@@ -24,10 +24,14 @@ pub const COMPOSITOR_PATH: &str = "/org/icedtea/Compositor";
 ///
 /// * `1` -- the pre-A2 contract.
 /// * `2` -- A2 batch 2: `WindowInfo.attention` / `WindowUpdate.attention`.
-/// * `3` -- M7 pointer/cursor/touch: `Snapshot.cursor_visible` /
+/// * `3` -- M8 IME depth: `Snapshot.ime_active` (the IME indicator bit).
+/// * `4` -- M8 remainder: `Snapshot.keyboard_layout` +
+///   `Snapshot.shortcuts_inhibited` (the keyboard-layout and
+///   shortcuts-inhibit indicator fields).
+/// * `5` -- M7 pointer/cursor/touch: `Snapshot.cursor_visible` /
 ///   `cursor_pos` / `touch_active`, plus the `GestureBegan` / `GestureEnded`
 ///   / `SwitchToggled` signals.
-pub const COMPOSITOR_CONTRACT_VERSION: u32 = 3;
+pub const COMPOSITOR_CONTRACT_VERSION: u32 = 5;
 
 pub use clipboard::{CLIP_BUS_NAME, CLIP_PATH, ClipEntry, ClipKind};
 pub use event::{Event, SeqEvent};

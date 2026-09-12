@@ -25,12 +25,4 @@ image = "0.25"
 [profile.dev.package."*"]
 opt-level = 2
 
-# M7 pointer/cursor/touch batch (Task 4): consume the wlr-m7-pointer
-# worktree's unpublished API (CursorState/TouchState/SwitchState snapshots,
-# PointerFrame/TouchFrame/GesturePhase tokens, constraint/gesture/touch/
-# switch events) ahead of the wlr 0.20.35 publish. Mirrors the B6/M8
-# pre-publish patches. DROP at B-FINAL: remove this section and pin
-# `wlr = "0.20.35"` in compositor/Cargo.toml once the release is published.
-[patch.crates-io]
-wlr = { path = "/home/joseph/Projects/wlroots-sys/.worktrees/wlr-m7-pointer/crates/wlr" }
 

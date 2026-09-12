@@ -15,7 +15,7 @@ rust-version.workspace = true
 icedtea-compositor = { path = "../compositor" }
 icedtea-config = { path = "../config" }
 icedtea-contract = { path = "../contract" }
-wlr = "0.20.31"
+wlr = "0.20.33"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
