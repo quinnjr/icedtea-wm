@@ -6504,6 +6504,114 @@ impl wlr::OutputHandler for State {
         runtime.update_output_manager_state();
     }
 
+    /// A client requested an output power mode: power the output off
+    /// ([`wlr::PowerMode::Off`]) or back on ([`wlr::PowerMode::On`]).
+    /// Off mirrors `output_configuration_applied`'s disable branch for this
+    /// id (model-side only: drop from the active set, record in
+    /// `disabled_outputs` keyed by id, migrate windows, run the settle
+    /// sequence); On mirrors its re-enable path via `take_disabled_output`
+    /// by connector name, rehydrating the output into the active set. The
+    /// strand guard is honored with `batch_enables = false`: a lone power
+    /// request names no batch enabling to replace the output, so powering
+    /// off the last active output is refused exactly like the interactive
+    /// path refuses it. Unknown modes never arrive (`wlr` misses them to
+    /// `None` upstream); the wildcard arm exists only because the enum is
+    /// non-exhaustive. No unwrap/expect/assert/indexing: same dispatch
+    /// path, same abort-through-C rule as the commit arms.
+    fn output_power_mode_requested(&mut self, output: wlr::OutputId, mode: wlr::PowerMode) {
+        match mode {
+            wlr::PowerMode::Off => {
+                let Some(runtime) = self.wayland.runtime().cloned() else {
+                    return;
+                };
+                // Index via `output_ids`: an unknown or already-disabled id
+                // simply has no model state to drop. Name and geometry come
+                // from the active surface -- no `AppliedHead` is needed, so
+                // the disable branch mirrors cleanly.
+                let Some(index) = self.output_ids.get(&output).copied() else {
+                    return;
+                };
+                let Some(surface) = self.outputs.get(&index) else {
+                    return;
+                };
+                let head_name = surface.name.clone();
+                let old_geometry = surface.geometry;
+                if self.disable_would_strand_session(index, false) {
+                    tracing::warn!(
+                        %head_name,
+                        "refusing to power off the last active output; keeping >=1 enabled to avoid a black screen"
+                    );
+                    return;
+                }
+                self.outputs.remove(&index);
+                self.disabled_outputs.insert(output, head_name);
+                self.output_ids.remove(&output);
+                self.migrate_windows_from(old_geometry);
+                // Settle exactly as `output_configuration_applied` does
+                // after its batch: reclaim, exclusive zones, scene,
+                // re-advertise.
+                self.reclaim_offscreen_windows();
+                self.arrange_layers();
+                self.sync_wallpaper_nodes();
+                self.sync_scene();
+                self.emit_pending();
+                self.resolve_orphaned_layers();
+                runtime.update_output_manager_state();
+            }
+            wlr::PowerMode::On => {
+                let Some(runtime) = self.wayland.runtime().cloned() else {
+                    return;
+                };
+                // An id that is not currently disabled has nothing to
+                // re-enable. `take_disabled_output`'s `None` covers both the
+                // no-match and the ambiguous same-name case (which it already
+                // warned about) -- either way there is nothing safe to
+                // rehydrate.
+                let Some(head_name) = self.disabled_outputs.get(&output).cloned() else {
+                    return;
+                };
+                let Some(oid) = self.take_disabled_output(&head_name) else {
+                    return;
+                };
+                let index = self.next_output_index;
+                self.next_output_index += 1;
+                // No `AppliedHead` here, so the head-dims middle fallback the
+                // applied path uses is unavailable: layout box straight to
+                // the same 1920x1080 last resort.
+                let geometry = runtime
+                    .output_layout_box(oid)
+                    .map(|(x, y, w, h)| icedtea_contract::Rectangle {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    })
+                    .unwrap_or(icedtea_contract::Rectangle {
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                    });
+                self.create_output(index, geometry);
+                if let Some(surface) = self.outputs.get_mut(&index) {
+                    surface.name = head_name;
+                }
+                self.output_ids.insert(oid, index);
+                // First-frame parity with `new_output`, as the applied
+                // path's rehydrate branch does.
+                let _ = runtime.schedule_frame(oid);
+                self.reclaim_offscreen_windows();
+                self.arrange_layers();
+                self.sync_wallpaper_nodes();
+                self.sync_scene();
+                self.emit_pending();
+                self.resolve_orphaned_layers();
+                runtime.update_output_manager_state();
+            }
+            _ => {}
+        }
+    }
+
     /// An output state committed: record the staged-field mask plus wlroots'
     /// commit timestamp under the output's id, then -- only when the commit
     /// staged a MODE -- re-derive that output's geometry through the same
