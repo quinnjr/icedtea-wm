@@ -121,3 +121,11 @@ fn switch_toggles_session_signal() { /* lid switch → session signal flips */ }
 - Spec §2 (snapshot/token/event typing) → Tasks 1-3; §5 events → Tasks 2-3; §6 consumer (cursor/constraint/touch/gesture/switch) → Task 4; §7 e2e → Tasks 2/4; §8 rollout (single 0.20.34) → Task 5 — no gap.
 - No placeholders; every step has concrete code and expected output.
 - Type names match across tasks (`CursorId`, `ConstraintId`, `GestureId`, `TouchId`, `SwitchId`, `PointerFrame`, `TouchFrame`, `GesturePhase`, `Snapshot.cursor_visible/cursor_pos/touch_active`).
+
+## Erratum (2026-09-12, controller ruling)
+
+- Release version is **0.20.35**, not 0.20.34 as written above: wlroots-sys
+  released 0.20.34 (M6 output rest, `1e305f6`) while M7 was in flight.
+  B-FINAL pins the real 0.20.35 after owner-approved `cargo publish`.
+- `wlr-m7-pointer` rebased onto `origin/develop@4e912b9` before freeze;
+  `tests/pointer.rs` byte-identical across the rebase, gates green.
