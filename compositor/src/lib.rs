@@ -381,4 +381,10 @@ pub fn create_compat_globals(
     if let Err(err) = runtime.create_gamma_control_manager(display) {
         tracing::error!(%err, "gamma-control unavailable; clients cannot set a display gamma ramp");
     }
+    if let Err(err) = runtime.create_tearing_control_manager(display, 1) {
+        tracing::error!(%err, "tearing control unavailable; clients get no tearing hints");
+    }
+    if let Err(err) = runtime.create_power_manager(display) {
+        tracing::error!(%err, "output power management unavailable; clients cannot request power modes");
+    }
 }
