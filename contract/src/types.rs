@@ -49,6 +49,40 @@ pub struct Snapshot {
     pub windows: Vec<WindowInfo>,
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace: u32,
+    /// Whether an IME is currently active for a focused+enabled text-input
+    /// (M8-7). `false` by default so snapshots encoded as JSON before this
+    /// field existed still decode; the D-Bus form remains version-gated
+    /// (contract v3 -- mixed versions fail loudly via `SignatureMismatch`).
+    #[serde(default)]
+    pub ime_active: bool,
+    /// Human-readable name of the live keyboard's effective layout (M8
+    /// remainder), or `None` when no keyboard is tracked. `None` by default
+    /// so snapshots encoded as JSON before this field existed still decode;
+    /// the D-Bus form remains version-gated (contract v4 -- mixed versions
+    /// fail loudly via `SignatureMismatch`).
+    #[serde(default)]
+    pub keyboard_layout: Option<String>,
+    /// Whether any keyboard-shortcuts inhibitor is currently active (M8
+    /// remainder). `false` by default, same additive-optional discipline as
+    /// `keyboard_layout` above.
+    #[serde(default)]
+    pub shortcuts_inhibited: bool,
+    /// Whether the seat cursor currently shows an image. M7: fed by the
+    /// compositor from `wlr::Runtime::cursor_state` (an image is applied on
+    /// the first pointer motion; before that the cursor is `Hidden`).
+    /// `#[serde(default)]` (false) so a pre-M7 snapshot still decodes.
+    #[serde(default)]
+    pub cursor_visible: bool,
+    /// The cursor's last-known position in output-logical coordinates, or
+    /// `None` before the first pointer motion. M7: the compositor's model
+    /// mirror of the crate cursor. `None` decodes from a missing field.
+    #[serde(default)]
+    pub cursor_pos: Option<(i32, i32)>,
+    /// Whether any touch point is currently down. M7: fed by the
+    /// compositor from `wlr::Runtime::touch_state`. `#[serde(default)]`
+    /// (false) so a pre-M7 snapshot still decodes.
+    #[serde(default)]
+    pub touch_active: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
@@ -141,6 +175,12 @@ mod tests {
                 },
             ],
             active_workspace: 0,
+            ime_active: false,
+            keyboard_layout: None,
+            shortcuts_inhibited: false,
+            cursor_visible: true,
+            cursor_pos: Some((10, 20)),
+            touch_active: false,
         }
     }
 
@@ -165,7 +205,7 @@ mod tests {
         assert_eq!(WorkspaceInfo::SIGNATURE.to_string(), "(us)");
         assert_eq!(
             Snapshot::SIGNATURE.to_string(),
-            "(ta(ussuu(iiii)bbbbb)a(us)u)"
+            "(ta(ussuu(iiii)bbbbb)a(us)ubasbba(ii)b)"
         );
         // `index: usize` marshals as `t` (u64) on 64-bit targets.
         assert_eq!(AltTabState::SIGNATURE.to_string(), "(baut)");
@@ -177,6 +217,69 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: Snapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    /// M8 remainder: the keyboard-layout and shortcuts-inhibit indicator
+    /// fields are additive-optional -- a snapshot encoded before they
+    /// existed (neither key present) still decodes, defaulting to no layout
+    /// and uninhibited. M7 cursor/touch fields default the same way.
+    #[test]
+    fn snapshot_json_without_m8_fields_defaults_to_uninhibited() {
+        let legacy = serde_json::json!({
+            "seq": 7,
+            "windows": [],
+            "workspaces": [],
+            "active_workspace": 0,
+        });
+        let back: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!back.ime_active, "a legacy snapshot names no active IME");
+        assert!(!back.cursor_visible);
+        assert_eq!(back.cursor_pos, None);
+        assert!(!back.touch_active);
+        assert_eq!(
+            back.keyboard_layout, None,
+            "a legacy snapshot names no layout"
+        );
+        assert!(
+            !back.shortcuts_inhibited,
+            "a legacy snapshot names no active inhibitor"
+        );
+    }
+
+    /// M8-7: the IME indicator field is additive-optional — a snapshot
+    /// encoded before it existed (no `ime_active` key) still
+    /// decodes, defaulting to inactive.
+    #[test]
+    fn snapshot_json_without_ime_fields_defaults_to_inactive() {
+        let legacy = serde_json::json!({
+            "seq": 7,
+            "windows": [],
+            "workspaces": [],
+            "active_workspace": 0,
+        });
+        let back: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!back.ime_active, "a legacy snapshot names no active IME");
+        assert!(!back.cursor_visible);
+        assert_eq!(back.cursor_pos, None);
+        assert!(!back.touch_active);
+    }
+
+    /// M7: a pre-M7 snapshot (no cursor/touch fields) still decodes, with
+    /// the new fields at their `#[serde(default)]` values -- the
+    /// additive-only contract discipline: an older compositor's `GetState`
+    /// reply never fails a newer shell's parse.
+    #[test]
+    fn pre_m7_snapshot_json_still_decodes() {
+        let legacy = serde_json::json!({
+            "seq": 7,
+            "windows": [],
+            "workspaces": [],
+            "active_workspace": 0,
+        });
+        let back: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!back.cursor_visible);
+        assert_eq!(back.cursor_pos, None);
+        assert!(!back.touch_active);
     }
 
     #[test]

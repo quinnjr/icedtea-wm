@@ -57,8 +57,14 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
 };
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
+    zwp_keyboard_shortcuts_inhibit_manager_v1, zwp_keyboard_shortcuts_inhibitor_v1,
+};
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_confined_pointer_v1, zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
+};
+use wayland_protocols::wp::pointer_gestures::zv1::client::{
+    zwp_pointer_gesture_pinch_v1, zwp_pointer_gesture_swipe_v1, zwp_pointer_gestures_v1,
 };
 use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::wp::primary_selection::zv1::client::{
@@ -339,6 +345,18 @@ impl Compositor {
             runtime
                 .create_idle_inhibit_manager(&display)
                 .expect("zwp_idle_inhibit_manager_v1");
+            // Same "harness cannot degrade" tone: the shortcuts-inhibit e2e
+            // binds this global directly and would assert against one that
+            // was never advertised.
+            runtime
+                .create_shortcuts_inhibit_manager(&display)
+                .expect("zwp_keyboard_shortcuts_inhibit_manager_v1");
+            // Same "harness cannot degrade" tone: the M8 globals test binds
+            // this global directly and would assert against one that was
+            // never advertised.
+            runtime
+                .create_tablet_manager(&display)
+                .expect("zwp_tablet_manager_v2");
             // Same "harness cannot degrade" tone: the pointer-constraints
             // tests bind these globals directly and would assert against
             // ones that were never advertised.
@@ -348,6 +366,12 @@ impl Compositor {
             runtime
                 .create_relative_pointer_manager(&display)
                 .expect("zwp_relative_pointer_manager_v1");
+            // Same "harness cannot degrade" tone: the M7 gesture double
+            // binds this global directly and would assert against one that
+            // was never advertised.
+            runtime
+                .create_pointer_gestures_manager(&display)
+                .expect("zwp_pointer_gestures_v1");
             // Same "harness cannot degrade" tone: the IME relay tests bind
             // these globals directly and would assert against ones that were
             // never advertised.
@@ -610,6 +634,51 @@ impl Compositor {
             .expect("compositor never answered InjectTouchUp");
     }
 
+    /// Drive the consumer's `SeatHandler::touch_cancelled` on the
+    /// compositor thread (M7). Headless has no wire producer for cancels,
+    /// so this clears the consumer mirror only -- the client sees no wire
+    /// cancel. Blocks on the reply -- see [`Self::inject_touch_down`]'s
+    /// doc.
+    pub fn inject_touch_cancel(&self) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InjectTouchCancel { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InjectTouchCancel");
+    }
+
+    /// Drive the consumer's `SeatHandler::gesture_began` (`began == true`)
+    /// or `gesture_ended` on the compositor thread (M7). Headless has no
+    /// gesture hardware, so the id names no live pointer -- harmless by
+    /// the handlers' contract. Blocks on the reply -- see
+    /// [`Self::inject_touch_down`]'s doc.
+    pub fn inject_gesture(&self, began: bool) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InjectGesture {
+            began,
+            reply: reply_tx,
+        });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InjectGesture");
+    }
+
+    /// Drive the consumer's switch-apply path on the compositor thread
+    /// (M7) with a hardware-decoded `(type, on)` pair no headless device
+    /// can produce. Blocks on the reply -- see
+    /// [`Self::inject_touch_down`]'s doc.
+    pub fn inject_switch_toggle(&self, switch_type: wlr::SwitchType, on: bool) {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::InjectSwitchToggle {
+            switch_type,
+            on,
+            reply: reply_tx,
+        });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered InjectSwitchToggle");
+    }
+
     /// The drag icon's current scene layout position, via
     /// `wlr::Runtime::drag_icon_position`. `None` if no drag with a visible
     /// icon is in progress. Blocks on the reply -- see
@@ -699,6 +768,50 @@ impl Compositor {
         reply_rx
             .recv_timeout(TIMEOUT)
             .expect("compositor never answered SceneNodePosition")
+    }
+
+    /// The scene position of the preedit overlay, or `None` when no
+    /// composing text is shown. The compositor half of the M8-6 overlay
+    /// tests: `Some` after an IME preedit commit, `None` after
+    /// commit-string, deactivate, or keyboard-focus change.
+    pub fn preedit_overlay(&self) -> Option<(i32, i32)> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.send(DbCommand::PreeditOverlay { reply: reply_tx });
+        reply_rx
+            .recv_timeout(TIMEOUT)
+            .expect("compositor never answered PreeditOverlay")
+    }
+
+    /// Poll `preedit_overlay()` until `pred` accepts or `TIMEOUT` elapses,
+    /// mirroring `TestClient::wait_until` but for the compositor oracle.
+    pub fn wait_until_preedit_overlay(&self, pred: impl Fn(Option<(i32, i32)>) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let v = self.preedit_overlay();
+            if pred(v) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Poll `input_popup_position()` until `pred` accepts or `TIMEOUT`
+    /// elapses.
+    pub fn wait_until_popup_position(&self, pred: impl Fn(Option<(i32, i32)>) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let v = self.input_popup_position();
+            if pred(v) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// The `Debug` name of the named cursor shape currently in force
@@ -814,6 +927,33 @@ impl Drop for Compositor {
             panic!("compositor thread panicked");
         }
     }
+}
+
+/// One gesture phase a `GestureClient` was sent, in arrival order (M7).
+///
+/// The phase log the harness double keeps: kind (swipe vs pinch), stage
+/// (begin/update/end/cancelled) and finger count. Headless produces no
+/// phases (they come from hardware gesture signals), so the log stays empty
+/// in tests -- it exists so the double records payloads the way every other
+/// double here does, and so runs against real hardware can assert on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedGesture {
+    /// Whether the phase belongs to the swipe or the pinch object.
+    pub swipe: bool,
+    /// The stage: begin, update, end, or cancelled (an `end` with the
+    /// protocol's `cancelled` bit set).
+    pub stage: GestureStage,
+    /// The finger count the phase carried.
+    pub fingers: u32,
+}
+
+/// The stage of a [`RecordedGesture`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GestureStage {
+    Begin,
+    Update,
+    End,
+    Cancelled,
 }
 
 /// What the client's `Dispatch` impls accumulate.
@@ -1019,11 +1159,25 @@ struct ClientState {
     /// This client's touch object, created when the seat advertises the
     /// touch capability -- mirrors `pointer`/`keyboard` above. The
     /// destination side of a touch drag learns about it entirely through
-    /// `wl_data_device`, never through this, so its events are unused
-    /// (`delegate_noop!` below); it only needs to exist so `get_touch` is
-    /// gated on the capability rather than called unconditionally, which
-    /// is a fatal protocol error on a seat that has not advertised touch.
+    /// `wl_data_device`, never through this; the M7 `TouchClient` double
+    /// reads the recorded streams below instead.
     touch: Option<wl_touch::WlTouch>,
+    // --- touch recording (M7) ---
+    /// Every `wl_touch.down` this client has seen, as
+    /// `(touch_id, surface_x, surface_y, serial)` in arrival order. The
+    /// payload a touch e2e asserts the focused surface received.
+    touch_downs: Vec<(i32, f64, f64, u32)>,
+    /// Every `wl_touch.motion` this client has seen, as
+    /// `(touch_id, surface_x, surface_y)` in arrival order.
+    touch_motions: Vec<(i32, f64, f64)>,
+    /// Every `wl_touch.up` this client has seen, as `(touch_id, serial)`
+    /// in arrival order.
+    touch_ups: Vec<(i32, u32)>,
+    /// How many `wl_touch.cancel` events this client has seen. Headless
+    /// produces none (cancels come from hardware), so this only advances
+    /// on real hardware -- recorded for completeness, same as the gesture
+    /// phase log below.
+    touch_cancels: u32,
 
     // --- screencopy (M4.3) ---
     output: Option<WlOutput>,
@@ -1055,6 +1209,11 @@ struct ClientState {
     /// As `idle_idled`, for `resumed`.
     idle_resumed: bool,
 
+    // --- keyboard shortcuts-inhibit (M8) ---
+    /// Bound whenever advertised; used by [`ShortcutsInhibitClient`].
+    shortcuts_inhibit_manager:
+        Option<zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1>,
+
     // --- pointer-constraints (M4.5) ---
     pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
     relative_pointer_manager: Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
@@ -1065,6 +1224,16 @@ struct ClientState {
     /// relative motion arrive at all" signal `relative_delta` alone cannot
     /// give (a delta that nets to exactly zero looks identical to "none").
     relative_motion_events: u32,
+
+    // --- pointer-gestures (M7) ---
+    /// Bound whenever advertised; used by [`GestureClient::spawn`].
+    gestures_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+    /// Every swipe/pinch phase this client has been sent, in arrival
+    /// order. Headless produces none (phases come from hardware gesture
+    /// signals), so this stays empty in tests -- recorded for completeness
+    /// and for runs against real hardware, the same shape as
+    /// `touch_cancels` above.
+    gesture_events: Vec<RecordedGesture>,
 
     // --- A2 batch-1 passive protocols (Task 7-9) ---
     /// Bound only by the [`TestClient::get_viewport`] path (task 8's
@@ -1134,6 +1303,9 @@ struct ClientState {
     text_input_deletes: Vec<(u32, u32)>,
     /// How many `zwp_text_input_v3.done` events this client has received.
     text_input_dones: u32,
+    /// Every `zwp_text_input_v3.done` event's serial, in arrival order (the
+    /// M8-8 pairing counterpart to the IME commit serial).
+    text_input_done_serials: Vec<u32>,
 
     // --- input-method (M6.1) ---
     /// Bound whenever advertised; used by [`InputMethodClient::spawn`].
@@ -1156,6 +1328,9 @@ struct ClientState {
     /// its `commit` request, per the protocol ("the value of the serial
     /// argument must be equal to the number of done events already issued").
     im_dones: u32,
+    /// Every `commit` request's serial this client has sent, in send order
+    /// (the M8-8 pairing counterpart to the text-input done serial).
+    im_commit_serials: Vec<u32>,
     /// Set true on the input-method's `unavailable` event -- sent when
     /// another input method is already associated with this seat.
     im_unavailable: bool,
@@ -1278,12 +1453,19 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
                 "zwp_idle_inhibit_manager_v1" => {
                     state.idle_inhibit_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
+                "zwp_keyboard_shortcuts_inhibit_manager_v1" => {
+                    state.shortcuts_inhibit_manager =
+                        Some(registry.bind(name, version.min(1), qh, ()));
+                }
                 "zwp_pointer_constraints_v1" => {
                     state.pointer_constraints = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 "zwp_relative_pointer_manager_v1" => {
                     state.relative_pointer_manager =
                         Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwp_pointer_gestures_v1" => {
+                    state.gestures_manager = Some(registry.bind(name, version.min(3), qh, ()));
                 }
                 "wp_viewporter" => {
                     state.viewporter = Some(registry.bind(name, version.min(1), qh, ()));
@@ -1698,7 +1880,43 @@ impl Dispatch<wl_seat::WlSeat, ()> for ClientState {
     }
 }
 
-delegate_noop!(ClientState: ignore wl_touch::WlTouch);
+impl Dispatch<wl_touch::WlTouch, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // M7: record every touch payload the way the pointer arm records
+        // its own -- the `TouchClient` double asserts on these streams.
+        // Recording only: nothing here changes protocol behavior, so the
+        // M4.2 touch-drag tests (which never read these) are unaffected.
+        match event {
+            wl_touch::Event::Down {
+                serial,
+                time: _,
+                surface: _,
+                id,
+                x,
+                y,
+            } => state.touch_downs.push((id, x, y, serial)),
+            wl_touch::Event::Up {
+                serial,
+                time: _,
+                id,
+            } => state.touch_ups.push((id, serial)),
+            wl_touch::Event::Motion { time: _, id, x, y } => {
+                state.touch_motions.push((id, x, y));
+            }
+            wl_touch::Event::Cancel => {
+                state.touch_cancels = state.touch_cancels.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wl_pointer::WlPointer, ()> for ClientState {
     fn event(
@@ -1963,10 +2181,111 @@ impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for ClientSta
 delegate_noop!(ClientState: ignore zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1);
 delegate_noop!(ClientState: ignore zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1);
 
+// --- keyboard shortcuts-inhibit (M8) ---
+// Neither object carries events this harness asserts on (the protocol is
+// fire-and-forget plus destroy): what matters is the compositor's own
+// behavior while an inhibitor lives, observed through `Snapshot` and the
+// forwarded keys, independently of these two objects.
+delegate_noop!(ClientState: ignore zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1);
+delegate_noop!(ClientState: ignore zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1);
+
 // --- pointer-constraints (M4.5) ---
 delegate_noop!(ClientState: ignore wl_region::WlRegion);
 delegate_noop!(ClientState: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
 delegate_noop!(ClientState: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
+delegate_noop!(ClientState: ignore zwp_pointer_gestures_v1::ZwpPointerGesturesV1);
+
+/// M7: record swipe phases into [`ClientState::gesture_events`]. The full
+/// payload (deltas) is client traffic the shell never sees; the log keeps
+/// kind, stage and finger count -- the phase triple the e2e vocabulary
+/// needs.
+impl Dispatch<zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
+        event: zwp_pointer_gesture_swipe_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_pointer_gesture_swipe_v1::Event::Begin { fingers, .. } => {
+                state.gesture_events.push(RecordedGesture {
+                    swipe: true,
+                    stage: GestureStage::Begin,
+                    fingers,
+                });
+            }
+            zwp_pointer_gesture_swipe_v1::Event::Update { .. } => {
+                state.gesture_events.push(RecordedGesture {
+                    swipe: true,
+                    stage: GestureStage::Update,
+                    // An update carries no finger count (only begin does),
+                    // so updates record zero rather than a stale value.
+                    fingers: 0,
+                });
+            }
+            zwp_pointer_gesture_swipe_v1::Event::End { cancelled, .. } => {
+                state.gesture_events.push(RecordedGesture {
+                    swipe: true,
+                    stage: if cancelled == 0 {
+                        GestureStage::End
+                    } else {
+                        GestureStage::Cancelled
+                    },
+                    // An end carries no finger count; the count is only
+                    // meaningful on begin/update, so ends record zero
+                    // rather than a stale value.
+                    fingers: 0,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// M7: record pinch phases, mirroring the swipe arm above.
+impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()> for ClientState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
+        event: zwp_pointer_gesture_pinch_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_pointer_gesture_pinch_v1::Event::Begin { fingers, .. } => {
+                state.gesture_events.push(RecordedGesture {
+                    swipe: false,
+                    stage: GestureStage::Begin,
+                    fingers,
+                });
+            }
+            zwp_pointer_gesture_pinch_v1::Event::Update { .. } => {
+                state.gesture_events.push(RecordedGesture {
+                    swipe: false,
+                    stage: GestureStage::Update,
+                    // An update carries no finger count (only begin does),
+                    // so updates record zero rather than a stale value.
+                    fingers: 0,
+                });
+            }
+            zwp_pointer_gesture_pinch_v1::Event::End { cancelled, .. } => {
+                state.gesture_events.push(RecordedGesture {
+                    swipe: false,
+                    stage: if cancelled == 0 {
+                        GestureStage::End
+                    } else {
+                        GestureStage::Cancelled
+                    },
+                    fingers: 0,
+                });
+            }
+            _ => {}
+        }
+    }
+}
 // `locked`/`unlocked` and `confined`/`unconfined` carry no data this harness
 // asserts on directly -- what matters for T6/T7 is the cursor position
 // (`Compositor::cursor_position`) and the relative-motion deltas below, both
@@ -2028,8 +2347,9 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for ClientState {
             } => {
                 state.text_input_deletes.push((before_length, after_length));
             }
-            zwp_text_input_v3::Event::Done { .. } => {
+            zwp_text_input_v3::Event::Done { serial } => {
                 state.text_input_dones = state.text_input_dones.saturating_add(1);
+                state.text_input_done_serials.push(serial);
             }
             _ => {}
         }
@@ -4977,6 +5297,124 @@ impl IdleInhibitClient {
     }
 }
 
+/// A `zwp_keyboard_shortcuts_inhibit_manager_v1` client: maps one toplevel
+/// (via [`TestClient`], so it holds keyboard focus -- an inhibitor only
+/// activates on the currently focused surface) and can inhibit the
+/// compositor's own keybindings on it, then release them again. Task 4's
+/// inhibit e2e driver.
+///
+/// The protocol carries no events back to the client (fire-and-forget plus
+/// destroy), so this double records what IT did -- every `inhibit`/`destroy`
+/// transition in send order -- and the test observes the compositor side
+/// independently through `Snapshot::shortcuts_inhibited` and the forwarded
+/// keys. That split is what keeps the e2e from asserting against its own
+/// requests.
+pub struct ShortcutsInhibitClient {
+    client: TestClient,
+    manager: zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+    /// The live inhibitor, if [`Self::inhibit`] has been called without a
+    /// matching [`Self::destroy`]. Kept alive: dropping it destroys the
+    /// object and ends the inhibition.
+    inhibitor: Option<zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1>,
+    /// Every transition this client sent, in order: `true` per `inhibit`,
+    /// `false` per `destroy`.
+    transitions: Vec<bool>,
+}
+
+impl ShortcutsInhibitClient {
+    /// Connect and map a toplevel. Panics if the compositor did not advertise
+    /// `zwp_keyboard_shortcuts_inhibit_manager_v1` or a seat.
+    pub fn spawn(socket: &str) -> ShortcutsInhibitClient {
+        let client = TestClient::map_toplevel(
+            socket,
+            "icedtea-harness-shortcuts-inhibit",
+            "shortcuts-inhibit",
+        );
+        let manager = client
+            .state
+            .shortcuts_inhibit_manager
+            .clone()
+            .expect("compositor did not advertise zwp_keyboard_shortcuts_inhibit_manager_v1");
+        ShortcutsInhibitClient {
+            client,
+            manager,
+            inhibitor: None,
+            transitions: Vec::new(),
+        }
+    }
+
+    /// Inhibit the compositor's keybindings on this client's (focused)
+    /// surface. Panics if one is already active -- callers destroy before
+    /// inhibiting again.
+    pub fn inhibit(&mut self) {
+        assert!(self.inhibitor.is_none(), "an inhibitor is already active");
+        let seat = self.client.state.seat.clone().expect("no seat");
+        let inhibitor =
+            self.manager
+                .inhibit_shortcuts(&self.client.surface, &seat, &self.client.qh, ());
+        self.client.conn.flush().expect("flush inhibit_shortcuts");
+        self.inhibitor = Some(inhibitor);
+        self.transitions.push(true);
+        self.pump();
+    }
+
+    /// Destroy the active inhibitor, releasing the compositor's keybindings.
+    /// Panics if none is active.
+    pub fn destroy(&mut self) {
+        let inhibitor = self
+            .inhibitor
+            .take()
+            .expect("no active inhibitor to destroy");
+        inhibitor.destroy();
+        self.client.conn.flush().expect("flush destroy inhibitor");
+        self.transitions.push(false);
+        self.pump();
+    }
+
+    /// Every transition this client sent, in order (`true` = inhibit,
+    /// `false` = destroy).
+    pub fn transitions(&self) -> &[bool] {
+        &self.transitions
+    }
+
+    /// Whether this client currently holds a live inhibitor.
+    pub fn is_active(&self) -> bool {
+        self.inhibitor.is_some()
+    }
+
+    /// How many `wl_keyboard.key` events this client's surface has received,
+    /// ever -- the inhibited-keys-still-reach-the-client observable.
+    pub fn key_events(&self) -> u32 {
+        self.client.state.key_events
+    }
+
+    /// Whether this client's surface currently holds keyboard focus input.
+    pub fn has_input_serial(&self) -> bool {
+        self.client.has_input_serial()
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        let _ = self.client.queue.roundtrip(&mut self.client.state);
+    }
+
+    /// Pump until `pred` accepts or the harness `TIMEOUT` elapses, mirroring
+    /// [`TestClient::wait_until`] for this wrapper's own state.
+    pub fn wait_until(&mut self, pred: impl Fn(&ShortcutsInhibitClient) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + crate::TIMEOUT;
+        loop {
+            self.pump();
+            if pred(self) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 /// A `zwp_pointer_constraints_v1` + `zwp_relative_pointer_manager_v1` client:
 /// maps one mapped toplevel (via [`TestClient`], so it can hold pointer
 /// focus -- constraints only ever activate on the currently focused
@@ -4988,9 +5426,12 @@ pub struct PointerConstraintsClient {
     /// Kept alive for the client's whole lifetime -- dropping it would stop
     /// relative-motion delivery.
     _relative_pointer: zwp_relative_pointer_v1::ZwpRelativePointerV1,
-    /// The active lock, if [`Self::lock_pointer`] has been called. Not
-    /// currently read back (no test yet needs to unlock explicitly), but
-    /// kept alive: dropping it destroys the object and ends the lock.
+    /// The active lock, if [`Self::lock_pointer`] has been called. Kept
+    /// alive so [`Self::unlock_pointer`] can destroy it explicitly:
+    /// dropping the proxy alone does NOT end the lock (wayland-client
+    /// only releases the client-side id on drop; the protocol `destroy`
+    /// must be sent), so this must not be dropped except through
+    /// `unlock_pointer`.
     locked_pointer: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
     /// The active confinement, if [`Self::confine_pointer`] has been called
     /// -- kept so [`Self::set_confine_region`] can update its region.
@@ -5156,6 +5597,235 @@ impl PointerConstraintsClient {
     /// One roundtrip.
     pub fn pump(&mut self) {
         let _ = self.client.queue.roundtrip(&mut self.client.state);
+    }
+
+    /// Release the active lock, if [`Self::lock_pointer`] was called.
+    /// Sends the protocol `destroy` (dropping the proxy alone does NOT
+    /// destroy the object -- wayland-client only releases the client-side
+    /// id on drop, so a drop-only "unlock" would leave the constraint
+    /// active and the cursor frozen) and drops it; the next motion after
+    /// that moves the cursor again. Panics if no lock is active.
+    pub fn unlock_pointer(&mut self) {
+        let locked = self
+            .locked_pointer
+            .take()
+            .expect("unlock_pointer called without an active lock");
+        locked.destroy();
+        self.client.conn.flush().expect("flush unlock_pointer");
+    }
+}
+
+/// A `wl_touch` app double: maps a focusable toplevel (via [`TestClient`],
+/// so it is the surface under injected touch points) and records every
+/// touch payload with its serial (M7). The `TouchClient` half of the
+/// brief's pointer/touch/gesture doubles; the pointer half is
+/// [`PointerClient`] below.
+pub struct TouchClient {
+    client: TestClient,
+}
+
+impl TouchClient {
+    /// Connect and map a toplevel. Panics if the compositor did not
+    /// advertise the touch capability (the harness boot enables the
+    /// test-touch stand-in, so a missing capability means a broken boot,
+    /// not a client problem).
+    pub fn spawn(socket: &str, app_id: &str, title: &str) -> TouchClient {
+        let client = TestClient::map_toplevel(socket, app_id, title);
+        assert!(
+            client.state.touch.is_some(),
+            "compositor advertised no touch capability"
+        );
+        TouchClient { client }
+    }
+
+    /// Every `wl_touch.down` seen so far, as
+    /// `(touch_id, surface_x, surface_y, serial)` in arrival order.
+    pub fn touch_downs(&self) -> &[(i32, f64, f64, u32)] {
+        &self.client.state.touch_downs
+    }
+
+    /// Every `wl_touch.motion` seen so far, as
+    /// `(touch_id, surface_x, surface_y)` in arrival order.
+    pub fn touch_motions(&self) -> &[(i32, f64, f64)] {
+        &self.client.state.touch_motions
+    }
+
+    /// Every `wl_touch.up` seen so far, as `(touch_id, serial)` in arrival
+    /// order.
+    pub fn touch_ups(&self) -> &[(i32, u32)] {
+        &self.client.state.touch_ups
+    }
+
+    /// How many `wl_touch.cancel` events have arrived, ever.
+    pub fn touch_cancels(&self) -> u32 {
+        self.client.state.touch_cancels
+    }
+
+    /// The mapped surface's last configure size, if any.
+    pub fn last_configure(&self) -> Option<(i32, i32)> {
+        self.client.last_configure()
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        self.client.pump();
+    }
+
+    /// Pump until `pred` holds or `TIMEOUT` lapses (mirrors
+    /// [`TestClient::wait_until`).
+    pub fn wait_until(&mut self, pred: impl Fn(&TouchClient) -> bool) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.client
+                .queue
+                .roundtrip(&mut self.client.state)
+                .expect("roundtrip");
+            if pred(self) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// A `zwp_pointer_gestures_v1` client double: binds the gestures manager,
+/// holds one swipe and one pinch object on the seat, and records every
+/// phase triple (M7). Headless produces no phases (they come from hardware
+/// gesture signals), so the log stays empty in tests -- the double exists
+/// so the bind path is proven and hardware runs can assert on phases, the
+/// same record-everything shape as every other double here.
+pub struct GestureClient {
+    client: TestClient,
+    /// Kept alive for the client's whole lifetime -- dropping a gesture
+    /// object stops its phases.
+    _swipe: zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
+    /// As `_swipe`, for pinch.
+    _pinch: zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
+}
+
+impl GestureClient {
+    /// Connect, map a toplevel, and create the swipe + pinch objects on
+    /// this client's pointer. Panics if the compositor did not advertise
+    /// `zwp_pointer_gestures_v1` or the pointer capability -- the latter
+    /// needs a pointer device behind the seat (a
+    /// [`VirtualPointerClient`] suffices), since the seat only advertises
+    /// pointer once a device backs it.
+    pub fn spawn(socket: &str) -> GestureClient {
+        let client = TestClient::map_toplevel(socket, "icedtea-harness-gestures", "gestures");
+        let manager = client
+            .state
+            .gestures_manager
+            .clone()
+            .expect("compositor did not advertise zwp_pointer_gestures_v1");
+        // Gesture objects hang off the `wl_pointer`, not the seat: the
+        // protocol routes phases to the pointer in whose gesture the
+        // fingers are.
+        let pointer = client
+            .state
+            .pointer
+            .clone()
+            .expect("compositor advertised no pointer capability");
+        let swipe = manager.get_swipe_gesture(&pointer, &client.qh, ());
+        let pinch = manager.get_pinch_gesture(&pointer, &client.qh, ());
+        client.conn.flush().expect("flush get_gestures");
+        let mut this = GestureClient {
+            client,
+            _swipe: swipe,
+            _pinch: pinch,
+        };
+        this.pump();
+        this
+    }
+
+    /// Every gesture phase seen so far, in arrival order.
+    pub fn gesture_events(&self) -> &[RecordedGesture] {
+        &self.client.state.gesture_events
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        let _ = self.client.queue.roundtrip(&mut self.client.state);
+    }
+}
+
+/// A `wl_pointer` observer double: maps a focusable toplevel (via
+/// [`TestClient`]) and records every pointer payload with its serial (M7).
+/// The `PointerClient` half of the brief's pointer/touch/gesture doubles;
+/// injection stays on [`VirtualPointerClient`], recording here.
+pub struct PointerClient {
+    client: TestClient,
+}
+
+impl PointerClient {
+    /// Connect and map a toplevel. Panics if the compositor did not
+    /// advertise the pointer capability -- which needs a pointer device
+    /// behind the seat first (a [`VirtualPointerClient`] suffices), since
+    /// the seat only advertises pointer once a device backs it.
+    pub fn spawn(socket: &str, app_id: &str, title: &str) -> PointerClient {
+        let client = TestClient::map_toplevel(socket, app_id, title);
+        assert!(
+            client.state.pointer.is_some(),
+            "compositor advertised no pointer capability"
+        );
+        PointerClient { client }
+    }
+
+    /// How many `wl_pointer.enter` events have arrived, ever.
+    pub fn pointer_enters(&self) -> u32 {
+        self.client.pointer_enters()
+    }
+
+    /// The surface-local coordinates of the most recent enter, if any.
+    pub fn pointer_enter_position(&self) -> Option<(f64, f64)> {
+        self.client.pointer_enter_position()
+    }
+
+    /// Every `wl_pointer.motion` seen so far, in surface-local coordinates.
+    pub fn pointer_motions(&self) -> &[(f64, f64)] {
+        self.client.pointer_motions()
+    }
+
+    /// Every `wl_pointer.button` seen so far, as `(button_code, pressed)`.
+    pub fn pointer_buttons(&self) -> &[(u32, bool)] {
+        self.client.pointer_buttons()
+    }
+
+    /// The last input-event serial seen on the pointer, if any.
+    pub fn last_pointer_serial(&self) -> Option<u32> {
+        self.client.last_pointer_serial()
+    }
+
+    /// One roundtrip.
+    pub fn pump(&mut self) {
+        self.client.pump();
+    }
+
+    /// Pump until `pred` holds or `TIMEOUT` lapses (mirrors
+    /// [`TestClient::wait_until`).
+    pub fn wait_until(&mut self, pred: impl Fn(&PointerClient) -> bool) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if pred(self) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.client
+                .queue
+                .roundtrip(&mut self.client.state)
+                .expect("roundtrip");
+            if pred(self) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -5337,6 +6007,11 @@ impl TextInputClient {
     pub fn dones(&self) -> u32 {
         self.client.state.text_input_dones
     }
+
+    /// Every `zwp_text_input_v3.done` event's serial, in arrival order.
+    pub fn done_serials(&self) -> &[u32] {
+        &self.client.state.text_input_done_serials
+    }
 }
 
 /// A `zwp_input_method_v2` IME/OSK double: binds the manager (surfaceless, like
@@ -5502,6 +6177,7 @@ impl InputMethodClient {
         if let Some((before, after)) = delete {
             self.input_method.delete_surrounding_text(before, after);
         }
+        self.state.im_commit_serials.push(self.state.im_dones);
         self.input_method.commit(self.state.im_dones);
         self.flush();
     }
@@ -5561,6 +6237,11 @@ impl InputMethodClient {
     /// How many `zwp_input_method_v2.done` events this client has received.
     pub fn dones(&self) -> u32 {
         self.state.im_dones
+    }
+
+    /// Every `commit` request's serial this client has sent, in send order.
+    pub fn commit_serials(&self) -> &[u32] {
+        &self.state.im_commit_serials
     }
 
     /// Whether the compositor sent `unavailable` -- another input method was

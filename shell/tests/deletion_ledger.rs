@@ -71,7 +71,10 @@ const DELETED_IDENTIFIERS: &[(&str, &str)] = &[
 /// Counts measured on the current tree (`ec42e64`): `src/taskbar.rs` and
 /// `src/clipboard.rs` each grew by one Arc-clone test during P0-P5.
 const KEPT_SUITES: &[(&str, usize)] = &[
-    ("src/taskbar.rs", 6),
+    // M7: 6 -> 8 (`snapshot_folds_touch_active...` and
+    // `gesture_and_switch_signals_fold` cover the new CompositorUpdate
+    // fold arms).
+    ("src/taskbar.rs", 8),
     ("src/clipboard.rs", 2),
     ("src/compositor_client.rs", 1),
     ("tests/live_dbus.rs", 1),

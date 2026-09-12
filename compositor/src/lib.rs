@@ -8,6 +8,7 @@ pub mod backend;
 pub mod config_combo;
 pub mod dbus;
 pub mod decoration;
+pub mod ime_overlay;
 pub mod input;
 pub mod input_method;
 pub mod layout;
@@ -118,6 +119,20 @@ pub fn run() {
     }
     if let Err(err) = runtime.create_idle_inhibit_manager(&display) {
         tracing::error!(%err, "idle inhibition is unavailable");
+    }
+    // Lets a focused client (games, remote-desktop viewers, drawing tools)
+    // ask that the compositor's own keybindings be skipped while it holds
+    // focus, so every key reaches it. Non-fatal: without this global such
+    // clients simply fall back to the compositor consuming its bindings.
+    if let Err(err) = runtime.create_shortcuts_inhibit_manager(&display) {
+        tracing::error!(%err, "shortcuts inhibition is unavailable");
+    }
+    // Bridges tablet tools and pads to tablet-aware clients
+    // (`zwp_tablet_manager_v2`). Non-fatal: without it a tablet still moves
+    // the cursor (the crate attaches every input device to it, tablet
+    // included), but no client ever sees tool/pad traffic.
+    if let Err(err) = runtime.create_tablet_manager(&display) {
+        tracing::error!(%err, "tablet input is unavailable");
     }
     // Lets clients (games, remote-desktop viewers, drawing tools) confine or
     // lock the pointer and read unaccelerated relative motion. Non-fatal:

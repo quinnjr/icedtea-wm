@@ -93,7 +93,7 @@ impl PopupKey {
 /// surface. Override-redirect X11 surfaces are never modelled and so never
 /// carry a `SurfaceKey`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SurfaceKey {
+pub(crate) enum SurfaceKey {
     Xdg(ToplevelKey),
     X11(wlr::XwaylandSurfaceId),
 }
@@ -535,7 +535,22 @@ impl Wayland {
         let Some(runtime) = self.runtime() else {
             return;
         };
-        match id.and_then(|id| self.surface_key(id)) {
+        Self::apply_focus_key(runtime, self.focus_key(id));
+    }
+
+    /// The focus target `id` resolves to — the value form of `surface_key`,
+    /// exposed so `State::change_keyboard_focus` can run the same dispatch
+    /// inside its IME-active transition guard without duplicating the match.
+    pub(crate) fn focus_key(&self, id: Option<WindowId>) -> Option<SurfaceKey> {
+        id.and_then(|id| self.surface_key(id))
+    }
+
+    /// Run the `keyboard_focus` dispatch against an explicit runtime: the
+    /// mechanism `keyboard_focus` uses, factored out so the `State` focus
+    /// helper shares it instead of reimplementing the fallback-to-clear on
+    /// a refused focus.
+    pub(crate) fn apply_focus_key(runtime: &wlr::Runtime, key: Option<SurfaceKey>) {
+        match key {
             Some(SurfaceKey::Xdg(key)) => {
                 if runtime.focus_toplevel_keyboard(key.0).is_none() {
                     runtime.clear_keyboard_focus();

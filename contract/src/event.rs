@@ -4,11 +4,34 @@ use crate::{AltTabState, Appearance, WindowId, WindowInfo, WindowUpdate, Workspa
 pub enum Event {
     WindowOpened(WindowInfo),
     WindowClosed(WindowId),
-    WindowUpdated { id: WindowId, update: WindowUpdate },
-    WorkspaceSet { id: u32, active: bool },
+    WindowUpdated {
+        id: WindowId,
+        update: WindowUpdate,
+    },
+    WorkspaceSet {
+        id: u32,
+        active: bool,
+    },
     WorkspaceList(Vec<WorkspaceInfo>),
     AltTabState(AltTabState),
     ConfigReloaded(Appearance),
+    /// M7: a pointer gesture began (swipe/pinch/hold announced by hardware).
+    /// Phase-only: the full-fidelity forward (kind, deltas, finger count)
+    /// already reached gesture clients through the crate's token path, so
+    /// all that remains for the shell feed is the phase. Emitted by the
+    /// consumer's `SeatHandler::gesture_began`.
+    GestureBegan,
+    /// M7: the in-flight gesture ended (completed or cancelled).
+    /// Emitted by the consumer's `SeatHandler::gesture_ended`.
+    GestureEnded,
+    /// M7: a switch toggled. `lid_closed` is the session reading derived
+    /// from the `(type, on)` pair (lid type and on position); non-lid
+    /// switches arrive with `false`. Emitted by the consumer's switch path;
+    /// the session (not the compositor model) decides what a closed lid
+    /// means. Signals, not widgets: the shell folds but does not render.
+    SwitchToggled {
+        lid_closed: bool,
+    },
 }
 
 /// An [`Event`] tagged with the `seq` its producing mutation advanced the

@@ -126,6 +126,22 @@ async fn run(tx: Sender<CompositorUpdate>) -> zbus::Result<()> {
                 .deserialize::<(u64, Vec<WorkspaceInfo>)>()
                 .ok()
                 .map(|(_, ws)| CompositorUpdate::WorkspaceList(ws)),
+            // M7: gesture phases carry no payload beyond `seq` (the phase
+            // is the member name); the switch signal carries the lid
+            // reading. Bodies that fail to deserialize are dropped, the
+            // same as every arm above.
+            Some("GestureBegan") => body
+                .deserialize::<u64>()
+                .ok()
+                .map(|_| CompositorUpdate::GestureBegan),
+            Some("GestureEnded") => body
+                .deserialize::<u64>()
+                .ok()
+                .map(|_| CompositorUpdate::GestureEnded),
+            Some("SwitchToggled") => body
+                .deserialize::<(u64, bool)>()
+                .ok()
+                .map(|(_, lid_closed)| CompositorUpdate::SwitchToggled { lid_closed }),
             _ => None,
         };
         if let Some(update) = update
