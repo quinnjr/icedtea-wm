@@ -18,6 +18,10 @@ use std::time::Instant;
 
 use icedtea_config::Config;
 use icedtea_contract::{AltTabState, Event, Rectangle, SeqEvent, WindowId};
+// `SeatHandler` for the M7 test-hook arms in `handle_command`, which drive
+// the real touch/gesture notifications (`touch_cancelled`,
+// `gesture_began/ended`) on the loop thread.
+use wlr::SeatHandler;
 
 use crate::input;
 use crate::layout::{self, SnapZone};
@@ -736,6 +740,30 @@ pub struct State {
     /// request only while a real button-down backs it, never on the
     /// client's claim alone.
     pub pointer_pressed: bool,
+    /// M7: whether any touch point is currently down. Set by the touch
+    /// notification handlers (`touch_down` sets, `touch_up` re-derives
+    /// from `Runtime::touch_state`, `touch_cancelled` clears) and by the
+    /// test-only `InjectTouch*` command arms the same way, and read by the
+    /// `GetState` arm into `Snapshot.touch_active` (which the panel renders
+    /// as its touch indicator). A model mirror rather than a live
+    /// `touch_state()` read at `GetState` time so `GetState` stays a pure
+    /// model read (see that arm's "no model mutation" comment).
+    pub touch_active: bool,
+    /// M7: whether the seat cursor currently shows an image. Refreshed on
+    /// every pointer path (motion, button) from `Runtime::cursor_state`'s
+    /// image when a runtime is attached (falling back to `true`: in
+    /// production a motion always applies an image first), and on
+    /// `new_output`. Read by the `GetState` arm into
+    /// `Snapshot.cursor_visible`.
+    pub cursor_visible: bool,
+    /// M7: the cursor's last-known position in output-logical coordinates,
+    /// or `None` before the first pointer motion. Updated wherever
+    /// `pointer_location` is (every `pointer_motion`/`pointer_button`),
+    /// but kept separate: `pointer_location` is the drag machine's live
+    /// input (always some pair, `(0, 0)` at boot), while this is the
+    /// shell-facing reading where "unknown yet" is expressible -- which is
+    /// what `Snapshot.cursor_pos` carries.
+    pub cursor_pos: Option<(i32, i32)>,
     /// On-disk location `reload_config_from_disk`/`handle_command`'s
     /// `ReloadConfig` worker thread reads from. `None` (the boot-time
     /// default) means "use `icedtea_config::default_db_path()`" -- this is
@@ -1209,6 +1237,16 @@ impl State {
             session_locked: false,
             pointer_location: (0, 0),
             pointer_pressed: false,
+            // M7 input mirrors, feeding `Snapshot.cursor_visible` /
+            // `cursor_pos` / `touch_active` (see each field's doc).
+            // `cursor_visible: false` is the truthful boot state: the
+            // crate applies the first cursor image on the first pointer
+            // motion (`ensure_cursor_image`), so before that the cursor
+            // is `Hidden`. `cursor_pos: None` for the same reason: the
+            // model has observed no cursor position yet.
+            touch_active: false,
+            cursor_visible: false,
+            cursor_pos: None,
             config_path: None,
             config_reload_tx: None,
             config_reload_rx: None,
@@ -4452,7 +4490,16 @@ impl State {
                 self.dismiss_popups_of_hidden_roots();
             }
             DbCommand::GetState(reply_tx) => {
-                let _ = reply_tx.send(self.window_manager.snapshot());
+                let mut snap = self.window_manager.snapshot();
+                // M7 input mirrors live on `State` (the window model has no
+                // runtime to read them from -- see `snapshot()`'s own doc).
+                // Pure reads: no model mutation happens here, so the early
+                // return below (skipping the unconditional `emit_pending()`)
+                // stays correct.
+                snap.cursor_visible = self.cursor_visible;
+                snap.cursor_pos = self.cursor_pos;
+                snap.touch_active = self.touch_active;
+                let _ = reply_tx.send(snap);
                 // No model mutation happened; nothing new to flush. Return
                 // early so the unconditional `emit_pending()` below (a
                 // no-op here, but let's not rely on that) stays meaningful
@@ -4475,6 +4522,11 @@ impl State {
                     .wayland
                     .runtime()
                     .and_then(|rt| rt.inject_touch_down(x, y, id, time_msec));
+                // M7: the inject path performs no `SeatHandler::touch_down`
+                // (only real hardware input emits it), so the arm refreshes
+                // the mirror itself -- exactly what that handler would have
+                // established (a minted down means a live point).
+                self.refresh_touch_active();
                 let _ = reply.send(serial);
                 return Some(());
             }
@@ -4488,6 +4540,7 @@ impl State {
                 if let Some(rt) = self.wayland.runtime() {
                     rt.inject_touch_motion(x, y, id, time_msec);
                 }
+                self.refresh_touch_active();
                 let _ = reply.send(());
                 return Some(());
             }
@@ -4499,6 +4552,48 @@ impl State {
                 if let Some(rt) = self.wayland.runtime() {
                     rt.inject_touch_up(id, time_msec);
                 }
+                // M7: the up removed the point; re-derive (multi-touch may
+                // still hold others).
+                self.refresh_touch_active();
+                let _ = reply.send(());
+                return Some(());
+            }
+            DbCommand::InjectTouchCancel { reply } => {
+                // M7, test-only: no wire producer for cancels exists
+                // headless (cancels come from hardware), so this calls the
+                // real `SeatHandler::touch_cancelled` on the loop thread.
+                // The wire cancel to the client is the crate's
+                // token-consuming `send_cancel`, which only real hardware
+                // input drives -- this clears the consumer mirror only.
+                self.touch_cancelled();
+                let _ = reply.send(());
+                return Some(());
+            }
+            DbCommand::InjectGesture { began, reply } => {
+                // M7, test-only: headless has no gesture hardware, so this
+                // calls the real `SeatHandler` notification on the loop
+                // thread. The id names no live pointer (nothing could),
+                // which is harmless by the handlers' contract.
+                if began {
+                    self.gesture_began(wlr::GestureId::dangling_nth_for_test(0));
+                } else {
+                    self.gesture_ended(wlr::GestureId::dangling_nth_for_test(0));
+                }
+                let _ = reply.send(());
+                return Some(());
+            }
+            DbCommand::InjectSwitchToggle {
+                switch_type,
+                on,
+                reply,
+            } => {
+                // M7, test-only: headless has no switch hardware, so this
+                // feeds the real apply path a hardware-decoded `(type, on)`
+                // pair no headless device can produce. The live
+                // `switch_toggled` handler resolves the same pair from the
+                // runtime aggregate before calling this function, so the
+                // hook-driven e2e proves the production fold.
+                self.apply_switch_toggle(switch_type, on);
                 let _ = reply.send(());
                 return Some(());
             }
@@ -5652,6 +5747,88 @@ impl State {
         if let Some(rt) = self.wayland.runtime() {
             rt.set_cursor_shape(shape);
         }
+        // A shape request means a visible cursor: something (a client with
+        // pointer focus, or the session lock path above) just named the
+        // image, so the pre-first-motion `Hidden` reading no longer holds.
+        self.cursor_visible = true;
+    }
+
+    /// M7: re-derive `touch_active` from the live seat touch state. The
+    /// up/inject arms call this rather than clearing unconditionally: other
+    /// points may still be down (multi-touch), and only the seat knows.
+    /// Without a runtime there is no seat to ask, which in production is
+    /// impossible on these paths (touch input implies a live seat) and in
+    /// unit tests means "no points": both read `false`.
+    fn refresh_touch_active(&mut self) {
+        self.touch_active = self
+            .wayland
+            .runtime()
+            .and_then(|rt| rt.touch_state())
+            .is_some_and(|s| !s.points.is_empty());
+    }
+
+    /// M7: record one observed cursor position and refresh the visibility
+    /// mirror alongside it. Called from every pointer path that carries a
+    /// position (motion, button): the crate applies the cursor image before
+    /// it emits either (`ensure_cursor_image`), so an observed position
+    /// normally means a showing image -- but the live `cursor_state` read
+    /// below is authoritative when a runtime exists, and without one (unit
+    /// tests) `true` is the only sane reading of "the pointer moved".
+    fn note_cursor_at(&mut self, pointer: (i32, i32)) {
+        self.cursor_pos = Some(pointer);
+        self.cursor_visible = self
+            .wayland
+            .runtime()
+            .and_then(|rt| rt.cursor_state())
+            .map(|s| s.image != wlr::CursorImage::Hidden)
+            .unwrap_or(true);
+    }
+
+    /// M7: fold one decoded switch toggle into the session feed. The same
+    /// function the live `switch_toggled` handler calls after resolving the
+    /// pair from the runtime aggregate, and the test-only
+    /// `InjectSwitchToggle` arm calls with a synthesized pair -- one path
+    /// for both, so the hook-driven e2e proves the production fold.
+    ///
+    /// The lid reading is what the session consumes; non-lid switches ride
+    /// along with `lid_closed: false` so the toggle itself stays visible on
+    /// the feed. This deliberately does NOT drive `session_locked`: that
+    /// flag gates focus reconciliation while a lock *surface* holds the
+    /// session, and a lid position is a power signal for the session to act
+    /// on, not a lock-surface assertion.
+    fn apply_switch_toggle(&mut self, switch_type: wlr::SwitchType, on: bool) {
+        let lid_closed = matches!(switch_type, wlr::SwitchType::Lid) && on;
+        self.emit(Event::SwitchToggled { lid_closed });
+        self.emit_pending();
+    }
+
+    /// M7 consumer half of the pointer-constraint gate: whether the focused
+    /// surface currently carries a LOCKED constraint.
+    ///
+    /// The crate enforces lock/confine itself before any `pointer_motion`
+    /// reaches this model (a locked cursor is frozen outright, so no motion
+    /// event arrives at all; a confined one arrives already clamped), which
+    /// is why this reads as redundant on the motion path -- and that is
+    /// exactly the point: the model must never advance focus, hover, drag
+    /// or resize on motion a lock froze, no matter which dispatch source
+    /// delivered it. Confined constraints need no model gate: the clamped
+    /// position they carry is already a legal model position.
+    ///
+    /// Anything without a runtime, without focus, or without a live
+    /// constraint reads "unlocked": the gate only ever closes on a positive
+    /// live read, never on a miss.
+    fn pointer_locked_for_focus(&self) -> bool {
+        let Some(focused) = self.focused_id() else {
+            return false;
+        };
+        let Some(key) = self.wayland.toplevel_for(focused) else {
+            return false;
+        };
+        let Some(rt) = self.wayland.runtime() else {
+            return false;
+        };
+        rt.constraint_state_for_surface(wlr::ConstraintSurface::Toplevel(key.0))
+            .is_some_and(|s| s.constraint_type == wlr::ConstraintType::Locked)
     }
 
     /// Raise `id`'s attention hint -- but only if the hint is one the user
@@ -5895,6 +6072,21 @@ impl wlr::OutputHandler for State {
         // shift the connect caused) with a bumped serial. A no-op when no
         // manager was created (`lib.rs::run` degrades gracefully).
         runtime.update_output_manager_state();
+
+        // M7: refresh the input mirrors against the new output set. The
+        // cursor<->layout attachment itself is crate-owned (`create_seat`
+        // attaches the cursor to the layout; per-output pinning via
+        // `map_cursor_to_output` is deliberately NOT done here -- on a
+        // multi-output layout it would strand the cursor on the newest
+        // output, and the whole-layout attach already covers every
+        // head). What this refreshes is the model's reading: a cursor
+        // image applied before this output existed, or touch points down
+        // across the hotplug.
+        self.cursor_visible = runtime
+            .cursor_state()
+            .map(|s| s.image != wlr::CursorImage::Hidden)
+            .unwrap_or(self.cursor_visible);
+        self.refresh_touch_active();
     }
 
     fn frame(&mut self, output: &wlr::Output<'_>) {
@@ -7246,6 +7438,22 @@ impl wlr::SeatHandler for State {
         // zero, which is what a pixel index wants.
         let pointer = (x as i32, y as i32);
         self.pointer_location = pointer;
+        // M7 shell mirror: every motion is an observed cursor position (see
+        // `note_cursor_at` for the visibility half). Positions arrive
+        // post-constraint from the crate, so this mirror can never run
+        // ahead of the real cursor.
+        self.note_cursor_at(pointer);
+
+        // M7 constraint gate (lock): a locked pointer's motion must not
+        // drive focus, hover, drag or resize (see
+        // `pointer_locked_for_focus`). The crate normally suppresses the
+        // event before it could arrive, making this defense-in-depth; the
+        // location mirror above still records it, since the crate cursor
+        // genuinely is where the event says.
+        if self.pointer_locked_for_focus() {
+            self.emit_pending();
+            return;
+        }
 
         // Finding F12: the hit test is computed exactly once per motion
         // event and handed to `update_ssd_hover` inside
@@ -7289,24 +7497,104 @@ impl wlr::SeatHandler for State {
         // next.
         let pointer = (x as i32, y as i32);
         self.pointer_location = pointer;
+        // M7 shell mirror, same as `pointer_motion`'s: a button event
+        // observes the cursor too.
+        self.note_cursor_at(pointer);
 
         if button != BTN_LEFT {
             return;
         }
 
         if pressed {
-            // The model answers "what is under the pointer", not the scene:
-            // the scene knows nothing about workspaces or minimization, and
-            // `window_at_point` is already MRU-ordered, which is a correct
-            // topmost-first order (review finding I1).
-            let Some(id) = self.window_at_point(pointer) else {
-                return;
-            };
-            self.handle_pointer(PointerEvent::Press { id, pointer });
+            // M7 constraint gate (lock): a locked pointer's clicks belong
+            // to the focused client -- they still reach it through the
+            // crate -- and must not start model drags or refocus windows.
+            if !self.pointer_locked_for_focus() {
+                // The model answers "what is under the pointer", not the scene:
+                // the scene knows nothing about workspaces or minimization, and
+                // `window_at_point` is already MRU-ordered, which is a correct
+                // topmost-first order (review finding I1).
+                let Some(id) = self.window_at_point(pointer) else {
+                    return;
+                };
+                self.handle_pointer(PointerEvent::Press { id, pointer });
+            }
         } else {
             self.handle_pointer(PointerEvent::Release { pointer });
         }
         self.emit_pending();
+    }
+
+    /// M7: a touch point went down.
+    ///
+    /// Notification-only, by crate design: the down already reached the
+    /// touch client through the token path before this runs, and the event
+    /// is id-only, so no position arrives and the model cannot focus the
+    /// touched window here. All that remains for the consumer is marking
+    /// the in-flight touch the snapshot (`touch_active`) and the panel
+    /// report. (The test-only `InjectTouchDown` arm knows its coordinates
+    /// but likewise only refreshes the flag: focusing there would give
+    /// test input model side-effects production hardware can never
+    /// produce. A position-carrying touch notification is a possible future
+    /// wlr gap -- deliberately not worked around here.)
+    fn touch_down(&mut self, _id: wlr::TouchId) {
+        self.touch_active = true;
+    }
+
+    /// M7: a touch point went up. Re-derived rather than cleared: other
+    /// points may still be down (multi-touch), and only the seat knows.
+    /// See `refresh_touch_active` for the no-runtime reading.
+    fn touch_up(&mut self, _id: wlr::TouchId) {
+        self.refresh_touch_active();
+    }
+
+    /// M7: the touch sequence was cancelled wholesale. No id arrives (the
+    /// cancel names no single point) and no points survive it, so this
+    /// clears unconditionally rather than re-deriving.
+    fn touch_cancelled(&mut self) {
+        self.touch_active = false;
+    }
+
+    /// M7: a pointer gesture began. Notification-only: the full-fidelity
+    /// forward (kind, deltas, finger count) already reached gesture clients
+    /// through the crate's token path, so the consumer only forwards the
+    /// phase to the shell feed. The id is deliberately unread -- an unknown
+    /// (deferred, device-gone) id is harmless by construction.
+    fn gesture_began(&mut self, _id: wlr::GestureId) {
+        self.emit(Event::GestureBegan);
+        self.emit_pending();
+    }
+
+    /// M7: the in-flight gesture ended (completed or cancelled -- both end
+    /// the gesture as far as this notification goes). Same terms as
+    /// `gesture_began`.
+    fn gesture_ended(&mut self, _id: wlr::GestureId) {
+        self.emit(Event::GestureEnded);
+        self.emit_pending();
+    }
+
+    /// M7: a switch toggled.
+    ///
+    /// The hardware signal names no device and no type, so the reading
+    /// comes from the runtime aggregate, which the crate recorded *before*
+    /// emitting (record-then-emit). Reading the aggregate rather than the
+    /// event's own `on` keeps the emitted signal self-consistent with what
+    /// `switch_state()` reports right now -- at the cost that a deferred
+    /// delivery of an older toggle reports the latest transition instead;
+    /// rapid double-toggles converge on the true final state either way.
+    /// Without a runtime -- impossible in production (a toggle implies a
+    /// live seat), reachable only in unit tests -- there is nothing
+    /// truthful to report, so this stays silent rather than guess a type.
+    fn switch_toggled(&mut self, _id: wlr::SwitchId, _on: bool) {
+        let Some(rt) = self.wayland.runtime() else {
+            tracing::debug!("switch toggled with no runtime attached; ignoring");
+            return;
+        };
+        let Some(state) = rt.switch_state() else {
+            tracing::debug!("switch toggled with no switch state recorded; ignoring");
+            return;
+        };
+        self.apply_switch_toggle(state.switch_type, state.on);
     }
 
     /// Track `wlr::Runtime::is_session_locked` locally so this model stops
@@ -14805,5 +15093,127 @@ mod tests {
         assert_eq!(state.popup_count(), 1);
         wlr::ToplevelHandler::layer_surface_destroyed(&mut state, layer);
         assert_eq!(state.popup_count(), 0);
+    }
+
+    /// M7: the touch notification handlers drive `touch_active` -- down
+    /// sets it, up re-derives it (no runtime in a unit test reads "no
+    /// points"), cancel clears it.
+    #[test]
+    fn touch_handlers_drive_touch_active() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert!(!state.touch_active, "no touch down yet");
+        wlr::SeatHandler::touch_down(&mut state, wlr::TouchId::dangling_nth_for_test(0));
+        assert!(state.touch_active, "down must mark touch active");
+        wlr::SeatHandler::touch_up(&mut state, wlr::TouchId::dangling_nth_for_test(0));
+        assert!(
+            !state.touch_active,
+            "up with no live points must clear touch active"
+        );
+        wlr::SeatHandler::touch_down(&mut state, wlr::TouchId::dangling_nth_for_test(1));
+        wlr::SeatHandler::touch_cancelled(&mut state);
+        assert!(
+            !state.touch_active,
+            "cancel must clear touch active unconditionally"
+        );
+    }
+
+    /// M7: gesture began/ended forward to the event feed in order with
+    /// their phases intact -- began maps to `GestureBegan`, ended to
+    /// `GestureEnded`, and an unknown (dangling) id changes nothing about
+    /// that mapping.
+    #[test]
+    fn gesture_handlers_emit_phases_in_order() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        wlr::SeatHandler::gesture_began(&mut state, wlr::GestureId::dangling_nth_for_test(0));
+        wlr::SeatHandler::gesture_ended(&mut state, wlr::GestureId::dangling_nth_for_test(0));
+        let got: Vec<Event> = vec![
+            rx.try_recv().expect("began").event,
+            rx.try_recv().expect("ended").event,
+        ];
+        assert_eq!(
+            got,
+            vec![Event::GestureBegan, Event::GestureEnded],
+            "phases must forward began-before-ended and intact"
+        );
+        assert!(rx.try_recv().is_err(), "nothing else may be emitted");
+    }
+
+    /// M7: the switch fold maps the hardware pair to the lid reading --
+    /// lid+on is closed, lid+off is open, and any non-lid switch reads
+    /// open regardless of position.
+    #[test]
+    fn apply_switch_toggle_maps_type_and_position_to_lid_closed() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.apply_switch_toggle(wlr::SwitchType::Lid, true);
+        state.apply_switch_toggle(wlr::SwitchType::TabletMode, true);
+        state.apply_switch_toggle(wlr::SwitchType::Lid, false);
+        let got: Vec<Event> = (0..3)
+            .map(|_| rx.try_recv().expect("switch event").event)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Event::SwitchToggled { lid_closed: true },
+                Event::SwitchToggled { lid_closed: false },
+                Event::SwitchToggled { lid_closed: false },
+            ]
+        );
+    }
+
+    /// M7: the live switch handler without a runtime stays silent -- it
+    /// cannot resolve the toggle's type, and guessing would emit a
+    /// possibly-wrong lid signal. (Production always has a runtime on this
+    /// path; only unit tests drive it without one.)
+    #[test]
+    fn switch_toggled_without_a_runtime_emits_nothing() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        wlr::SeatHandler::switch_toggled(&mut state, wlr::SwitchId::dangling_nth_for_test(0), true);
+        assert!(
+            rx.try_recv().is_err(),
+            "an unresolvable toggle must stay silent"
+        );
+        assert!(
+            !state.session_locked,
+            "a switch must never drive the session lock flag"
+        );
+    }
+
+    /// M7: pointer motion records the shell-facing cursor mirror -- a
+    /// position and (with no runtime to read an image from) a visible
+    /// cursor. The constraint gate stays open without a runtime: there is
+    /// no live constraint to lock on.
+    #[test]
+    fn pointer_motion_records_the_cursor_mirror() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        assert_eq!(state.cursor_pos, None);
+        assert!(!state.cursor_visible);
+        state.pointer_motion(12.0, 34.0, 1);
+        assert_eq!(state.cursor_pos, Some((12, 34)));
+        assert!(state.cursor_visible);
+        assert!(!state.pointer_locked_for_focus());
+    }
+
+    /// M7: `GetState` carries the input mirrors (cursor + touch) the shell
+    /// renders and holds.
+    #[test]
+    fn get_state_carries_the_input_mirrors() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        state.cursor_visible = true;
+        state.cursor_pos = Some((7, 9));
+        state.touch_active = true;
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        state.handle_command(crate::dbus::DbCommand::GetState(reply_tx));
+        let snap = reply_rx.try_recv().expect("GetState reply");
+        assert!(snap.cursor_visible);
+        assert_eq!(snap.cursor_pos, Some((7, 9)));
+        assert!(snap.touch_active);
+        // The enrichment is a pure read: nothing new was queued behind it.
+        assert!(rx.try_recv().is_err());
     }
 }

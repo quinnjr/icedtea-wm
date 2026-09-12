@@ -12,9 +12,9 @@
 use icedtea_contract::{Event, Rectangle};
 
 use icedtea_harness::{
-    Compositor, DataControlClient, IdleInhibitClient, IdleNotifyClient, InputMethodClient,
-    PointerConstraintsClient, SessionLockClient, TestClient, TextInputClient,
-    VirtualKeyboardClient, VirtualPointerClient,
+    Compositor, DataControlClient, GestureClient, IdleInhibitClient, IdleNotifyClient,
+    InputMethodClient, PointerClient, PointerConstraintsClient, SessionLockClient, TestClient,
+    TextInputClient, TouchClient, VirtualKeyboardClient, VirtualPointerClient,
 };
 
 /// A data-control client's set (no serial) reaches a focused wl_data_device
@@ -3439,5 +3439,330 @@ fn destroying_the_input_method_cascades_its_popups_away() {
         destroyed,
         "the popup's scene node must be destroyed with the popup, not just \
          unrecorded; node {node:?} still resolves"
+    );
+}
+
+/// M7 Task 4 (consumer) e2e 1: warping the cursor onto a mapped toplevel
+/// delivers pointer-enter on that surface with a cursor image applied.
+///
+/// Consumer-side warp is virtual-pointer absolute motion: `wlr`'s own
+/// `warp_cursor` is `pub(crate)` (an intentional API shape -- the crate moves
+/// the cursor itself inside its motion handlers), so the closest consumer
+/// path to "warp to a surface" is an absolute motion at its center. The
+/// assertions prove the consumer half of R1: the enter reaches the surface,
+/// and the post-motion snapshot reports a visible cursor at that position
+/// (fed by `Runtime::cursor_state`, whose `Hidden` -> image transition the
+/// crate performs on motion).
+#[test]
+fn cursor_warp_reaches_surface() {
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+
+    let comp = Compositor::spawn();
+    // The warp driver first: the seat only advertises the pointer
+    // capability once a pointer device backs it, and the observer double
+    // below asserts on it at spawn (same ordering the M4.5 lock test
+    // relies on).
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    // The pointer-observer double: it maps the toplevel the warp targets
+    // and records the enter the warp must deliver.
+    let mut a = PointerClient::spawn(&comp.socket, "cursor.app", "cursor");
+    // Synchronize model-side: the spawn roundtrips only pump the client,
+    // so wait for the compositor's own announcement before reading
+    // geometry out of its snapshot.
+    comp.wait_event(|e| matches!(e, Event::WindowOpened(w) if w.app_id == "cursor.app"));
+    let geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == "cursor.app")
+        .expect("A must be in the model once mapped")
+        .geometry;
+    let (cx, cy) = (
+        (geo.x + geo.width / 2) as f64,
+        (geo.y + geo.height / 2) as f64,
+    );
+
+    // Pre-motion: no cursor image has been applied yet, so the snapshot
+    // reports it hidden at no known position.
+    let before = comp.snapshot();
+    assert!(
+        !before.cursor_visible,
+        "a fresh compositor has applied no cursor image yet"
+    );
+    assert_eq!(before.cursor_pos, None, "no motion yet, no known position");
+
+    vp.motion_absolute(cx, cy, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+    assert!(
+        a.wait_until(|c| c.pointer_enters() > 0),
+        "A never received pointer-enter after the warp"
+    );
+    a.pump();
+
+    let after = comp.snapshot();
+    assert!(
+        after.cursor_visible,
+        "cursor image must be set after motion"
+    );
+    assert_eq!(
+        after.cursor_pos,
+        Some((cx as i32, cy as i32)),
+        "snapshot cursor position must track the warp target"
+    );
+    assert!(
+        !after.touch_active,
+        "a pointer warp must not read as touch activity"
+    );
+}
+
+/// M7 Task 4 (consumer) e2e 2: touch down/motion/up reaches the focused
+/// surface; a cancel clears the in-flight touch state.
+///
+/// The down/motion/up travel the crate's `TouchFrame` token path (proven by
+/// the client's own touch stream); the snapshot's `touch_active` proves the
+/// consumer's `Runtime::touch_state` reader. The cancel has no wire
+/// producer headless (cancels come from hardware), so it is driven through
+/// the test hook that calls the real `SeatHandler::touch_cancelled` on the
+/// loop thread -- the flag it clears is the same one the snapshot reports.
+#[test]
+fn touch_down_reaches_focused_surface() {
+    let comp = Compositor::spawn();
+    let mut t = TouchClient::spawn(&comp.socket, "touch.app", "touch");
+    assert!(
+        t.wait_until(|c| c.last_configure().is_some()),
+        "touch client never configured"
+    );
+    let geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.app_id == "touch.app")
+        .expect("touch client must be in the model once mapped")
+        .geometry;
+    let (cx, cy) = (
+        (geo.x + geo.width / 2) as f64,
+        (geo.y + geo.height / 2) as f64,
+    );
+
+    let serial = comp.inject_touch_down(cx, cy, 0, 1);
+    assert!(serial.is_some(), "touch-down minted no grab serial");
+    assert!(
+        t.wait_until(|c| !c.touch_downs().is_empty()),
+        "focused surface never received the touch down"
+    );
+    let (id, x, y, _) = t.touch_downs()[0];
+    assert_eq!(id, 0, "down must carry the injected touch id");
+    assert!(
+        x >= 0.0 && y >= 0.0,
+        "down coordinates must be surface-local and non-negative, got ({x}, {y})"
+    );
+    assert!(
+        comp.snapshot().touch_active,
+        "snapshot must report touch_active while a point is down"
+    );
+
+    comp.inject_touch_motion(cx + 5.0, cy + 5.0, 0, 2);
+    assert!(
+        t.wait_until(|c| !c.touch_motions().is_empty()),
+        "focused surface never received the touch motion"
+    );
+
+    comp.inject_touch_up(0, 3);
+    assert!(
+        t.wait_until(|c| !c.touch_ups().is_empty()),
+        "focused surface never received the touch up"
+    );
+    // The up removed the point: the reader path must report inactive again.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if !comp.snapshot().touch_active {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "touch_active stayed set after the point lifted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Cancel clears: a fresh down, then the hook-driven cancel.
+    assert!(comp.inject_touch_down(cx, cy, 1, 4).is_some());
+    assert!(
+        t.wait_until(|c| c.touch_downs().len() == 2),
+        "second touch down never arrived"
+    );
+    assert!(
+        comp.snapshot().touch_active,
+        "second down must re-assert touch_active"
+    );
+    comp.inject_touch_cancel();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if !comp.snapshot().touch_active {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "touch_active stayed set after the cancel"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    comp.inject_touch_up(1, 5);
+}
+
+/// M7 Task 4 (consumer) e2e 3: pinch begin -> end reaches the shell feed
+/// with its phases intact.
+///
+/// Headless has no gesture hardware, so the phases are driven through the
+/// test hooks that call the real `SeatHandler::gesture_began/ended` on the
+/// loop thread. What this proves end to end: the consumer notification maps
+/// to the contract event stream (the exact `SeqEvent` feed the D-Bus emitter
+/// forwards to the shell as signals) in order, began before ended. The
+/// `GestureClient` bind proves the gestures global the full-fidelity client
+/// path needs is advertised.
+#[test]
+fn pinch_phase_reaches_shell() {
+    let comp = Compositor::spawn();
+    // A pointer device must exist before any client can hold a
+    // `wl_pointer` for its gesture objects: the seat only advertises the
+    // pointer capability once a device backs it (same ordering the M4.5
+    // lock test relies on).
+    let mut _vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut g = GestureClient::spawn(&comp.socket);
+    g.pump();
+
+    comp.inject_gesture(true);
+    let began = comp.wait_event(|e| matches!(e, Event::GestureBegan));
+    assert!(
+        matches!(began, Event::GestureBegan),
+        "expected GestureBegan, got {began:?}"
+    );
+    comp.inject_gesture(false);
+    let ended = comp.wait_event(|e| matches!(e, Event::GestureEnded));
+    assert!(
+        matches!(ended, Event::GestureEnded),
+        "expected GestureEnded, got {ended:?}"
+    );
+}
+
+/// M7 Task 4 (consumer) e2e 4: a lid-switch toggle flips the session
+/// signal.
+///
+/// Headless has no switch hardware, so the toggle is driven through the
+/// test hook that calls the consumer's real switch-apply path on the loop
+/// thread with the hardware-decoded `(type, on)` pair. The contract event
+/// carries the lid reading the session consumes; a non-lid switch must not
+/// read as a lid signal.
+#[test]
+fn switch_toggles_session_signal() {
+    use wlr::SwitchType;
+
+    let comp = Compositor::spawn();
+
+    comp.inject_switch_toggle(SwitchType::Lid, true);
+    let closed = comp.wait_event(|e| matches!(e, Event::SwitchToggled { lid_closed: true }));
+    assert!(
+        matches!(closed, Event::SwitchToggled { lid_closed: true }),
+        "lid close must flip the session signal closed, got {closed:?}"
+    );
+
+    comp.inject_switch_toggle(SwitchType::TabletMode, true);
+    let not_lid = comp.wait_event(|e| matches!(e, Event::SwitchToggled { lid_closed: false }));
+    assert!(
+        matches!(not_lid, Event::SwitchToggled { lid_closed: false }),
+        "a tablet-mode switch must not read as a lid signal, got {not_lid:?}"
+    );
+
+    comp.inject_switch_toggle(SwitchType::Lid, false);
+    let opened = comp.wait_event(|e| matches!(e, Event::SwitchToggled { lid_closed: false }));
+    assert!(
+        matches!(opened, Event::SwitchToggled { lid_closed: false }),
+        "lid open must flip the session signal back, got {opened:?}"
+    );
+}
+
+/// M7 Task 4 (consumer) e2e 5 (spec section 7 item 4): a locked pointer
+/// freezes the model's pointer too, and releasing the lock unfreezes it.
+///
+/// The crate already freezes the cursor (M4.5's freeze test); this proves
+/// the consumer half: the snapshot's cursor position -- the model's own
+/// mirror, fed through `SeatHandler::pointer_motion` -- does not advance
+/// under the lock and resumes after it. The confinement gate rides the same
+/// model chokepoint the lock gate does.
+#[test]
+fn constraint_lock_freezes_model_pointer() {
+    const OUTPUT_W: u32 = 1280;
+    const OUTPUT_H: u32 = 720;
+
+    let comp = Compositor::spawn();
+    let mut vp = VirtualPointerClient::spawn(&comp.socket);
+    let mut pc = PointerConstraintsClient::spawn(&comp.socket);
+
+    let opened = comp.wait_event(
+        |e| matches!(e, Event::WindowOpened(w) if w.app_id == "icedtea-harness-pointer-constraints"),
+    );
+    let Event::WindowOpened(pc_info) = opened else {
+        unreachable!()
+    };
+    let pc_geo = comp
+        .snapshot()
+        .windows
+        .iter()
+        .find(|w| w.id == pc_info.id)
+        .expect("pc must be in the model once mapped")
+        .geometry;
+    let (px, py) = (
+        (pc_geo.x + pc_geo.width / 2) as f64,
+        (pc_geo.y + pc_geo.height / 2) as f64,
+    );
+    vp.motion_absolute(px, py, OUTPUT_W, OUTPUT_H);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+
+    // Lock, prime activation (see the M4.5 freeze test's doc), then measure.
+    pc.lock_pointer();
+    pc.pump();
+    vp.motion(5.0, 5.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    comp.settle();
+    let frozen = comp.snapshot().cursor_pos;
+    assert!(
+        frozen.is_some(),
+        "the model must know the cursor position before the freeze window"
+    );
+
+    vp.motion(20.0, 20.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    comp.settle();
+    assert_eq!(
+        comp.snapshot().cursor_pos,
+        frozen,
+        "locked: the model's pointer must not move once active"
+    );
+
+    // Release: dropping the lock must unfreeze the model again. The
+    // destroy travels the constraints client's connection while the next
+    // motion travels the virtual pointer's -- two connections, no
+    // ordering -- so settle first, giving the loop a chance to process
+    // the destroy before the motion that must move again.
+    pc.unlock_pointer();
+    pc.pump();
+    comp.settle();
+    vp.motion(20.0, 20.0);
+    vp.frame();
+    vp.pump();
+    pc.pump();
+    comp.settle();
+    assert_ne!(
+        comp.snapshot().cursor_pos,
+        frozen,
+        "released: the model's pointer must move again after unlock"
     );
 }

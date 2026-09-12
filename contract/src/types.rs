@@ -49,6 +49,22 @@ pub struct Snapshot {
     pub windows: Vec<WindowInfo>,
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace: u32,
+    /// Whether the seat cursor currently shows an image. M7: fed by the
+    /// compositor from `wlr::Runtime::cursor_state` (an image is applied on
+    /// the first pointer motion; before that the cursor is `Hidden`).
+    /// `#[serde(default)]` (false) so a pre-M7 snapshot still decodes.
+    #[serde(default)]
+    pub cursor_visible: bool,
+    /// The cursor's last-known position in output-logical coordinates, or
+    /// `None` before the first pointer motion. M7: the compositor's model
+    /// mirror of the crate cursor. `None` decodes from a missing field.
+    #[serde(default)]
+    pub cursor_pos: Option<(i32, i32)>,
+    /// Whether any touch point is currently down. M7: fed by the
+    /// compositor from `wlr::Runtime::touch_state`. `#[serde(default)]`
+    /// (false) so a pre-M7 snapshot still decodes.
+    #[serde(default)]
+    pub touch_active: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
@@ -141,6 +157,9 @@ mod tests {
                 },
             ],
             active_workspace: 0,
+            cursor_visible: true,
+            cursor_pos: Some((10, 20)),
+            touch_active: false,
         }
     }
 
@@ -165,7 +184,7 @@ mod tests {
         assert_eq!(WorkspaceInfo::SIGNATURE.to_string(), "(us)");
         assert_eq!(
             Snapshot::SIGNATURE.to_string(),
-            "(ta(ussuu(iiii)bbbbb)a(us)u)"
+            "(ta(ussuu(iiii)bbbbb)a(us)uba(ii)b)"
         );
         // `index: usize` marshals as `t` (u64) on 64-bit targets.
         assert_eq!(AltTabState::SIGNATURE.to_string(), "(baut)");
@@ -177,6 +196,24 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: Snapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    /// M7: a pre-M7 snapshot (no cursor/touch fields) still decodes, with
+    /// the new fields at their `#[serde(default)]` values -- the
+    /// additive-only contract discipline: an older compositor's `GetState`
+    /// reply never fails a newer shell's parse.
+    #[test]
+    fn pre_m7_snapshot_json_still_decodes() {
+        let legacy = serde_json::json!({
+            "seq": 7,
+            "windows": [],
+            "workspaces": [],
+            "active_workspace": 0,
+        });
+        let back: Snapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!back.cursor_visible);
+        assert_eq!(back.cursor_pos, None);
+        assert!(!back.touch_active);
     }
 
     #[test]

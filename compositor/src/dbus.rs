@@ -122,6 +122,34 @@ pub enum DbCommand {
         time_msec: u32,
         reply: Sender<()>,
     },
+    /// Test-only: drive the M7 touch-cancel consumer path. Headless has no
+    /// wire producer for cancels (they come from hardware), so this calls
+    /// the real `SeatHandler::touch_cancelled` on the loop thread; the
+    /// wire cancel to the client (the crate's token-consuming
+    /// `send_cancel`) stays hardware-driven. See `InjectTouchDown`'s doc
+    /// for why this is not a `CompositorInterface` operation.
+    InjectTouchCancel {
+        reply: Sender<()>,
+    },
+    /// Test-only: drive the M7 gesture consumer path. Headless has no
+    /// gesture hardware, so this calls the real
+    /// `SeatHandler::gesture_began`/`gesture_ended` on the loop thread with
+    /// an id that names no live pointer (harmless by the handlers'
+    /// contract). See `InjectTouchDown`'s doc.
+    InjectGesture {
+        began: bool,
+        reply: Sender<()>,
+    },
+    /// Test-only: drive the M7 switch consumer path with a
+    /// hardware-decoded `(type, on)` pair no headless device can produce.
+    /// Calls the same `apply_switch_toggle` the live `switch_toggled`
+    /// handler calls after resolving the pair from the runtime aggregate.
+    /// See `InjectTouchDown`'s doc.
+    InjectSwitchToggle {
+        switch_type: wlr::SwitchType,
+        on: bool,
+        reply: Sender<()>,
+    },
     /// Test-only: read the drag icon's current scene layout position via
     /// `wlr::Runtime::drag_icon_position`, replying with `None` if no drag
     /// with a visible icon is in progress. Not reachable from
@@ -291,6 +319,9 @@ pub fn event_signal_name(event: &Event) -> &'static str {
         Event::WorkspaceList(_) => "WorkspaceList",
         Event::AltTabState(_) => "AltTabState",
         Event::ConfigReloaded(_) => "ConfigReloaded",
+        Event::GestureBegan => "GestureBegan",
+        Event::GestureEnded => "GestureEnded",
+        Event::SwitchToggled { .. } => "SwitchToggled",
     }
 }
 
@@ -350,6 +381,9 @@ impl CompositorInterface {
             windows: vec![],
             workspaces: vec![],
             active_workspace: 0,
+            cursor_visible: false,
+            cursor_pos: None,
+            touch_active: false,
         })
     }
     /// The wire-contract revision this compositor speaks
@@ -436,6 +470,14 @@ pub fn spawn_service(
             //   WorkspaceList  ta(us)
             //   AltTabState    t(baut)
             //   ConfigReloaded t(siii(sss)as)
+            //   GestureBegan   t
+            //   GestureEnded   t
+            //   SwitchToggled  (tb)
+            // (M7: the gesture signals carry no payload beyond `seq` -- the
+            // phase is the member name itself, since the full-fidelity
+            // gesture data already reached clients through the crate's token
+            // path and never belonged on this feed. A bare `seq` rather
+            // than a 1-tuple keeps the body an ordinary `u64`.)
             let result = match &event {
                 Event::WindowOpened(info) => emitter_conn.emit_signal(
                     dest,
@@ -485,6 +527,19 @@ pub fn spawn_service(
                     COMPOSITOR_BUS_NAME,
                     name,
                     &(seq, a.clone()),
+                ),
+                Event::GestureBegan => {
+                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &seq)
+                }
+                Event::GestureEnded => {
+                    emitter_conn.emit_signal(dest, COMPOSITOR_PATH, COMPOSITOR_BUS_NAME, name, &seq)
+                }
+                Event::SwitchToggled { lid_closed } => emitter_conn.emit_signal(
+                    dest,
+                    COMPOSITOR_PATH,
+                    COMPOSITOR_BUS_NAME,
+                    name,
+                    &(seq, *lid_closed),
                 ),
             };
             if let Err(err) = result {
@@ -548,6 +603,18 @@ mod tests {
                 index: 0
             })),
             "AltTabState"
+        );
+        // M7: every new `Event` variant needs a name mapping too -- same
+        // rule as the fix-round addition above.
+        assert_eq!(event_signal_name(&Event::GestureBegan), "GestureBegan");
+        assert_eq!(event_signal_name(&Event::GestureEnded), "GestureEnded");
+        assert_eq!(
+            event_signal_name(&Event::SwitchToggled { lid_closed: true }),
+            "SwitchToggled"
+        );
+        assert_eq!(
+            event_signal_name(&Event::SwitchToggled { lid_closed: false }),
+            "SwitchToggled"
         );
     }
 

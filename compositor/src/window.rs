@@ -673,6 +673,12 @@ impl WindowManager {
             windows: self.windows.values().map(|w| self.to_info(w)).collect(),
             workspaces: self.workspace_info(),
             active_workspace: self.active_workspace,
+            // M7 input mirrors live on `State`, not on this model (which
+            // has no runtime): defaults here, enriched by
+            // `State::handle_command`'s `GetState` arm before the reply.
+            cursor_visible: false,
+            cursor_pos: None,
+            touch_active: false,
         }
     }
 

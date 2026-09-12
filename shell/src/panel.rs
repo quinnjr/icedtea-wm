@@ -335,15 +335,34 @@ pub fn update(m: &mut PanelModel, msg: Msg) -> Cmd<Msg> {
 
 /// The whole bar. `#bar` is what `style.css`'s first selector names.
 pub fn view(m: &PanelModel) -> View<Msg> {
-    box_(
-        Orientation::Horizontal,
-        [workspaces(m), windows(m), clip_button(m)],
-    )
-    .id("bar")
-    // See `bar_width`'s doc comment and `style.css`'s `#bar` rule: this is
-    // the one mechanism that actually reaches taffy for a plain box's
-    // centred, non-`ChildLayout` child.
-    .width_request(m.bar_width)
+    // M7: the touch indicator sits between the windows and the clip
+    // button when (and only when) a touch point is down. Conditional, not
+    // always-present-but-dim: an indicator for a state that is almost
+    // always off should take no layout space while off.
+    let mut children = vec![workspaces(m), windows(m)];
+    if let Some(indicator) = touch_indicator(m) {
+        children.push(indicator);
+    }
+    children.push(clip_button(m));
+    box_(Orientation::Horizontal, children)
+        .id("bar")
+        // See `bar_width`'s doc comment and `style.css`'s `#bar` rule: this is
+        // the one mechanism that actually reaches taffy for a plain box's
+        // centred, non-`ChildLayout` child.
+        .width_request(m.bar_width)
+}
+
+/// M7: the touch-activity indicator. Present only while a touch point is
+/// down (`TaskbarModel::touch_active`, folded from the snapshot's
+/// `touch_active`): a `#touch` node carrying the `active` class, the same
+/// class vocabulary the workspace and clip buttons use for the same "this
+/// is the one" meaning. Signals, not widgets otherwise -- the panel shows
+/// *that* touch is down, nothing about where.
+fn touch_indicator(m: &PanelModel) -> Option<View<Msg>> {
+    if !m.taskbar.touch_active {
+        return None;
+    }
+    Some(button("touch").key(u64::MAX).id("touch").class("active"))
 }
 
 /// One button per workspace, keyed by workspace id.
@@ -719,6 +738,9 @@ mod tests {
             windows,
             workspaces,
             active_workspace: 0,
+            cursor_visible: false,
+            cursor_pos: None,
+            touch_active: false,
         }
     }
 
@@ -835,8 +857,60 @@ mod tests {
         assert_eq!(
             ids,
             vec![Some("workspaces"), Some("windows"), Some("clip")],
-            "contract §3.3's order: workspaces, windows, clip"
+            "contract §3.3's order: workspaces, windows, clip (no touch down, no indicator)"
         );
+    }
+
+    /// M7: while a touch point is down the bar gains a `#touch` indicator
+    /// between the windows and the clip button, carrying the `active`
+    /// class; with no touch down the bar is exactly the three-node shape
+    /// the test above pins.
+    #[test]
+    fn a_touch_down_adds_an_active_touch_indicator_to_the_bar() {
+        let (mut m, _, _) = seeded();
+        assert!(
+            by_id(&view(&m), "touch").is_none(),
+            "no touch down, no indicator"
+        );
+        let _ = update(
+            &mut m,
+            Msg::Compositor(Arc::new(CompositorUpdate::Snapshot(Snapshot {
+                seq: 2,
+                windows: vec![],
+                workspaces: vec![],
+                active_workspace: 0,
+                cursor_visible: true,
+                cursor_pos: Some((8, 8)),
+                touch_active: true,
+            }))),
+        );
+        let v = view(&m);
+        let ids: Vec<Option<&str>> = v
+            .children
+            .iter()
+            .map(|c| c.props.str(PropName::Id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                Some("workspaces"),
+                Some("windows"),
+                Some("touch"),
+                Some("clip")
+            ],
+            "the indicator sits between windows and clip"
+        );
+        let classes = match by_id(&v, "touch")
+            .expect("touch indicator")
+            .props
+            .get(PropName::Classes)
+        {
+            Some(icedtea_ui::view::Prop::Classes(list)) => {
+                list.iter().map(|c| c.to_string()).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+        assert!(classes.contains(&"active".to_string()));
     }
 
     #[test]
