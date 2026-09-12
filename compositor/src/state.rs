@@ -801,6 +801,26 @@ pub struct State {
     /// id alongside `output_ids` so the map keeps covering exactly the live
     /// set instead of leaking one entry per unplugged output.
     pub last_commit: HashMap<wlr::OutputId, (wlr::CommittedFields, std::time::Duration)>,
+    /// The last damage extents observed per live output: the smallest box
+    /// containing every rectangle of the region
+    /// `OutputHandler::output_damaged` was given, via `Region::extents`.
+    /// Written in emission order, so the surviving entry is the latest
+    /// damage's view. Keyed by the always-unique [`wlr::OutputId`], like
+    /// `output_ids`. Observation only -- damage recorded here never touches
+    /// the render loop (the frame callback commits the scene on its own
+    /// schedule). `pub` so later wire-up tasks and integration tests can
+    /// read it; the damage handler only ever `insert`s, while `destroyed`
+    /// prunes the dead id alongside `output_ids` so the map keeps covering
+    /// exactly the live set instead of leaking one entry per unplugged
+    /// output.
+    pub last_damage: HashMap<wlr::OutputId, wlr::Box2D>,
+    /// The last client-requested output state per live output: the
+    /// field mask `OutputHandler::output_state_requested` was given (the
+    /// output-management protocol's ask, not what was applied). Mask only
+    /// -- a literal apply from a mask is impossible; the full apply lives
+    /// in `output_configuration_applied`. Same insert-only handler plus
+    /// `destroyed`-prunes shape as `last_commit`/`last_damage`.
+    pub last_request: HashMap<wlr::OutputId, wlr::CommittedFields>,
     /// A scale `DbCommand::SetOutputScaleForTest` wants pushed onto the
     /// *live* `wlr::Output` (not just this model's `OutputSurface::scale`
     /// mirror) the next time `OutputHandler::frame` hands one back for that
@@ -1271,6 +1291,8 @@ impl State {
             config_reload_rx: None,
             output_ids: HashMap::new(),
             last_commit: HashMap::new(),
+            last_damage: HashMap::new(),
+            last_request: HashMap::new(),
             pending_test_output_scale: None,
             disabled_outputs: HashMap::new(),
             config_db_lock: Arc::new(Mutex::new(())),
@@ -6226,6 +6248,8 @@ impl wlr::OutputHandler for State {
         // dead id's entry (if any) with the rest of its model state rather
         // than leaking one entry per unplugged output.
         self.last_commit.remove(&id);
+        self.last_damage.remove(&id);
+        self.last_request.remove(&id);
         // `remove` on an unknown id, not indexing: this can name an output
         // this handler was never told about (see the library's own docs), and
         // a panic here aborts.
@@ -6563,6 +6587,33 @@ impl wlr::OutputHandler for State {
         when: std::time::Duration,
     ) {
         self.last_commit.insert(output.id(), (fields, when));
+    }
+
+    /// An output reported damage: record the damaged region's extents under
+    /// the output's id. Record only -- this must not touch the render loop
+    /// (the frame callback commits the scene on its own schedule). No
+    /// unwrap/expect/assert/indexing: same dispatch path, same
+    /// abort-through-C rule as the commit arms above.
+    fn output_damaged(&mut self, output: &wlr::Output<'_>, damage: wlr::Region) {
+        self.last_damage.insert(output.id(), damage.extents());
+        tracing::debug!(?damage, "output damaged");
+    }
+
+    /// A client bound this output's global. Notification-only (see the trait
+    /// doc): there is nothing to stash here, only a trace for anyone reading
+    /// logs. No unwrap/expect/assert/indexing.
+    fn output_bound(&mut self, output: &wlr::Output<'_>) {
+        tracing::info!("client bound output global");
+        let _ = output;
+    }
+
+    /// A client requested an output state change: record the requested field
+    /// mask under the output's id. Mask only -- a literal apply from a mask
+    /// is impossible; the full apply lives in
+    /// `output_configuration_applied`. No unwrap/expect/assert/indexing.
+    fn output_state_requested(&mut self, output: &wlr::Output<'_>, fields: wlr::CommittedFields) {
+        self.last_request.insert(output.id(), fields);
+        tracing::info!(?fields, "client requested output state (mask only; full apply lives in output_configuration_applied)");
     }
 
     /// A `gamma-control-v1` client set (or wlroots otherwise changed) this
