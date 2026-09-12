@@ -788,6 +788,39 @@ pub struct State {
     /// Kept because `OutputHandler::destroyed` is given only an id, and the
     /// model's geometry map is keyed by index.
     output_ids: HashMap<wlr::OutputId, u32>,
+    /// The last commit observed per live output: the staged-field mask plus
+    /// wlroots' commit timestamp, written by both
+    /// `OutputHandler::output_committed` (applied) and
+    /// `OutputHandler::output_precommitted` (staged, not yet applied) in
+    /// emission order, so the surviving entry is the commit's view. Keyed by
+    /// the always-unique [`wlr::OutputId`], like `output_ids`. Observation
+    /// only -- the state is already applied (or, for precommit, staged) by
+    /// the time either handler runs, so nothing here vetoes or recommits.
+    /// `pub` so later wire-up tasks and integration tests can read it; the
+    /// commit handlers only ever `insert`, while `destroyed` prunes the dead
+    /// id alongside `output_ids` so the map keeps covering exactly the live
+    /// set instead of leaking one entry per unplugged output.
+    pub last_commit: HashMap<wlr::OutputId, (wlr::CommittedFields, std::time::Duration)>,
+    /// The last damage extents observed per live output: the smallest box
+    /// containing every rectangle of the region
+    /// `OutputHandler::output_damaged` was given, via `Region::extents`.
+    /// Written in emission order, so the surviving entry is the latest
+    /// damage's view. Keyed by the always-unique [`wlr::OutputId`], like
+    /// `output_ids`. Observation only -- damage recorded here never touches
+    /// the render loop (the frame callback commits the scene on its own
+    /// schedule). `pub` so later wire-up tasks and integration tests can
+    /// read it; the damage handler only ever `insert`s, while `destroyed`
+    /// prunes the dead id alongside `output_ids` so the map keeps covering
+    /// exactly the live set instead of leaking one entry per unplugged
+    /// output.
+    pub last_damage: HashMap<wlr::OutputId, wlr::Box2D>,
+    /// The last client-requested output state per live output: the
+    /// field mask `OutputHandler::output_state_requested` was given (the
+    /// output-management protocol's ask, not what was applied). Mask only
+    /// -- a literal apply from a mask is impossible; the full apply lives
+    /// in `output_configuration_applied`. Same insert-only handler plus
+    /// `destroyed`-prunes shape as `last_commit`/`last_damage`.
+    pub last_request: HashMap<wlr::OutputId, wlr::CommittedFields>,
     /// A scale `DbCommand::SetOutputScaleForTest` wants pushed onto the
     /// *live* `wlr::Output` (not just this model's `OutputSurface::scale`
     /// mirror) the next time `OutputHandler::frame` hands one back for that
@@ -1257,6 +1290,9 @@ impl State {
             config_reload_tx: None,
             config_reload_rx: None,
             output_ids: HashMap::new(),
+            last_commit: HashMap::new(),
+            last_damage: HashMap::new(),
+            last_request: HashMap::new(),
             pending_test_output_scale: None,
             disabled_outputs: HashMap::new(),
             config_db_lock: Arc::new(Mutex::new(())),
@@ -6208,6 +6244,12 @@ impl wlr::OutputHandler for State {
         // outlive the physical output and a reconnected connector reusing the
         // name could rehydrate a dead id.
         self.disabled_outputs.remove(&id);
+        // The commit-observation record covers exactly the live set: drop the
+        // dead id's entry (if any) with the rest of its model state rather
+        // than leaking one entry per unplugged output.
+        self.last_commit.remove(&id);
+        self.last_damage.remove(&id);
+        self.last_request.remove(&id);
         // `remove` on an unknown id, not indexing: this can name an output
         // this handler was never told about (see the library's own docs), and
         // a panic here aborts.
@@ -6460,6 +6502,226 @@ impl wlr::OutputHandler for State {
         // The trait doc REQUIRES this once the layout is settled and
         // persisted, so other bound managers see the fresh state + serial.
         runtime.update_output_manager_state();
+    }
+
+    /// A client requested an output power mode: power the output off
+    /// ([`wlr::PowerMode::Off`]) or back on ([`wlr::PowerMode::On`]).
+    /// Off mirrors `output_configuration_applied`'s disable branch for this
+    /// id (model-side only: drop from the active set, record in
+    /// `disabled_outputs` keyed by id, migrate windows, run the settle
+    /// sequence); On mirrors its re-enable path via `take_disabled_output`
+    /// by connector name, rehydrating the output into the active set. The
+    /// strand guard is honored with `batch_enables = false`: a lone power
+    /// request names no batch enabling to replace the output, so powering
+    /// off the last active output is refused exactly like the interactive
+    /// path refuses it. Unknown modes never arrive (`wlr` misses them to
+    /// `None` upstream); the wildcard arm exists only because the enum is
+    /// non-exhaustive. No unwrap/expect/assert/indexing: same dispatch
+    /// path, same abort-through-C rule as the commit arms.
+    fn output_power_mode_requested(&mut self, output: wlr::OutputId, mode: wlr::PowerMode) {
+        match mode {
+            wlr::PowerMode::Off => {
+                let Some(runtime) = self.wayland.runtime().cloned() else {
+                    return;
+                };
+                // Index via `output_ids`: an unknown or already-disabled id
+                // simply has no model state to drop. Name and geometry come
+                // from the active surface -- no `AppliedHead` is needed, so
+                // the disable branch mirrors cleanly.
+                let Some(index) = self.output_ids.get(&output).copied() else {
+                    return;
+                };
+                let Some(surface) = self.outputs.get(&index) else {
+                    return;
+                };
+                let head_name = surface.name.clone();
+                let old_geometry = surface.geometry;
+                if self.disable_would_strand_session(index, false) {
+                    tracing::warn!(
+                        %head_name,
+                        "refusing to power off the last active output; keeping >=1 enabled to avoid a black screen"
+                    );
+                    return;
+                }
+                self.outputs.remove(&index);
+                self.disabled_outputs.insert(output, head_name);
+                self.output_ids.remove(&output);
+                self.migrate_windows_from(old_geometry);
+                // Settle exactly as `output_configuration_applied` does
+                // after its batch: reclaim, exclusive zones, scene,
+                // re-advertise.
+                self.reclaim_offscreen_windows();
+                self.arrange_layers();
+                self.sync_wallpaper_nodes();
+                self.sync_scene();
+                self.emit_pending();
+                self.resolve_orphaned_layers();
+                runtime.update_output_manager_state();
+            }
+            wlr::PowerMode::On => {
+                let Some(runtime) = self.wayland.runtime().cloned() else {
+                    return;
+                };
+                // An id that is not currently disabled has nothing to
+                // re-enable. `take_disabled_output`'s `None` covers both the
+                // no-match and the ambiguous same-name case (which it already
+                // warned about) -- either way there is nothing safe to
+                // rehydrate.
+                let Some(head_name) = self.disabled_outputs.get(&output).cloned() else {
+                    return;
+                };
+                let Some(oid) = self.take_disabled_output(&head_name) else {
+                    return;
+                };
+                let index = self.next_output_index;
+                self.next_output_index += 1;
+                // No `AppliedHead` here, so the head-dims middle fallback the
+                // applied path uses is unavailable: layout box straight to
+                // the same 1920x1080 last resort.
+                let geometry = runtime
+                    .output_layout_box(oid)
+                    .map(|(x, y, w, h)| icedtea_contract::Rectangle {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    })
+                    .unwrap_or(icedtea_contract::Rectangle {
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                    });
+                self.create_output(index, geometry);
+                if let Some(surface) = self.outputs.get_mut(&index) {
+                    surface.name = head_name;
+                }
+                self.output_ids.insert(oid, index);
+                // First-frame parity with `new_output`, as the applied
+                // path's rehydrate branch does.
+                let _ = runtime.schedule_frame(oid);
+                self.reclaim_offscreen_windows();
+                self.arrange_layers();
+                self.sync_wallpaper_nodes();
+                self.sync_scene();
+                self.emit_pending();
+                self.resolve_orphaned_layers();
+                runtime.update_output_manager_state();
+            }
+            _ => {}
+        }
+    }
+
+    /// An output state committed: record the staged-field mask plus wlroots'
+    /// commit timestamp under the output's id, then -- only when the commit
+    /// staged a MODE -- re-derive that output's geometry through the same
+    /// layout path `output_configuration_applied`'s enabled branch uses and
+    /// settle the scene behind it. This fires for every commit, including
+    /// ones this compositor did not make (backend-driven mode repair, for
+    /// instance): it is observation, not a veto point, so nothing here
+    /// stages new state or recommits -- only the model is brought back in
+    /// step with what wlroots already applied. No unwrap/expect/assert/
+    /// indexing: this runs on the dispatch path, where a panic aborts
+    /// through C.
+    fn output_committed(
+        &mut self,
+        output: &wlr::Output<'_>,
+        fields: wlr::CommittedFields,
+        when: std::time::Duration,
+    ) {
+        self.last_commit.insert(output.id(), (fields, when));
+        if !fields.contains(wlr::CommittedFields::MODE) {
+            return;
+        }
+        let Some(runtime) = self.wayland.runtime().cloned() else {
+            return;
+        };
+        let oid = output.id();
+        // Mirror `output_configuration_applied`'s enabled branch: id -> our
+        // index via `get` (an unknown id simply has no model state to
+        // re-derive), geometry from the layout box wlroots just committed,
+        // falling back to the prior box so the output is never collapsed to
+        // nothing. Deliberately no other fallback: inventing a box from the
+        // live size here would be a new geometry path, not the mirror.
+        let Some(index) = self.output_ids.get(&oid).copied() else {
+            return;
+        };
+        let old_geometry = self.outputs.get(&index).map(|o| o.geometry);
+        let geometry = runtime
+            .output_layout_box(oid)
+            .map(|(x, y, w, h)| icedtea_contract::Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+            })
+            .or(old_geometry);
+        if let (Some(surface), Some(geometry)) = (self.outputs.get_mut(&index), geometry) {
+            surface.geometry = geometry;
+            // `arrange_layers`/exclusive zones recompute `usable`; reset it
+            // to the full box for now, exactly as a fresh `create_output`
+            // and the applied-config handler do.
+            surface.usable = geometry;
+        } else {
+            return;
+        }
+        // Mirror the settle sequence `output_configuration_applied` runs
+        // after re-deriving: a mode change can shrink an output and strand
+        // windows, so reclaim against the fully-updated geometry, recompute
+        // exclusive zones, and re-run the scene sequence a hotplug runs.
+        self.reclaim_offscreen_windows();
+        self.arrange_layers();
+        self.sync_wallpaper_nodes();
+        self.sync_scene();
+        self.emit_pending();
+        self.resolve_orphaned_layers();
+        // The layout moved under a live output: re-advertise so bound
+        // managers see the fresh state, as the applied-config handler does
+        // once its own layout is settled.
+        runtime.update_output_manager_state();
+    }
+
+    /// An output state is about to commit: record the staged-field mask plus
+    /// wlroots' timestamp under the output's id, exactly as
+    /// `output_committed` does. Staged, not yet applied -- so unlike the
+    /// commit arm there is no geometry to re-derive here; the commit that
+    /// follows (same emission order, same mask) overwrites this entry with
+    /// the applied view. No unwrap/expect/assert/indexing: same dispatch
+    /// path, same abort-through-C rule.
+    fn output_precommitted(
+        &mut self,
+        output: &wlr::Output<'_>,
+        fields: wlr::CommittedFields,
+        when: std::time::Duration,
+    ) {
+        self.last_commit.insert(output.id(), (fields, when));
+    }
+
+    /// An output reported damage: record the damaged region's extents under
+    /// the output's id. Record only -- this must not touch the render loop
+    /// (the frame callback commits the scene on its own schedule). No
+    /// unwrap/expect/assert/indexing: same dispatch path, same
+    /// abort-through-C rule as the commit arms above.
+    fn output_damaged(&mut self, output: &wlr::Output<'_>, damage: wlr::Region) {
+        self.last_damage.insert(output.id(), damage.extents());
+        tracing::debug!(?damage, "output damaged");
+    }
+
+    /// A client bound this output's global. Notification-only (see the trait
+    /// doc): there is nothing to stash here, only a trace for anyone reading
+    /// logs. No unwrap/expect/assert/indexing.
+    fn output_bound(&mut self, output: &wlr::Output<'_>) {
+        tracing::info!("client bound output global");
+        let _ = output;
+    }
+
+    /// A client requested an output state change: record the requested field
+    /// mask under the output's id. Mask only -- a literal apply from a mask
+    /// is impossible; the full apply lives in
+    /// `output_configuration_applied`. No unwrap/expect/assert/indexing.
+    fn output_state_requested(&mut self, output: &wlr::Output<'_>, fields: wlr::CommittedFields) {
+        self.last_request.insert(output.id(), fields);
+        tracing::info!(?fields, "client requested output state (mask only; full apply lives in output_configuration_applied)");
     }
 
     /// A `gamma-control-v1` client set (or wlroots otherwise changed) this

@@ -348,6 +348,104 @@ fn a_disabled_output_can_be_re_enabled_within_a_session() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+/// Task 3 (wlr 0.20.34 wire-up): `OutputHandler::output_committed` /
+/// `output_precommitted` observe every commit into `state.last_commit`,
+/// keyed by live output id, and an external MODE commit re-derives geometry
+/// through the layout path.
+///
+/// No handler is driven directly: a `wlr::Output` handle cannot be built
+/// outside the crate, so the headless loop's own commits (enable commits at
+/// boot, which stage MODE, plus the frame path's scene commits) flow through
+/// wlroots' precommit-then-commit emission and both handlers record. The
+/// single slot is last-writer-wins in emission order, so the surviving record
+/// per output is the commit's view of the staged fields; asserting its mask
+/// is non-empty pins that both the staged mask and the commit timestamp made
+/// it into the model. Record-only, assert-after-run (a panic inside a
+/// handler body aborts through C).
+#[test]
+fn output_commit_and_precommit_are_observed_per_output() {
+    let boot = boot_lock();
+    let display = wlr::Display::new().expect("display");
+    let backend = wlr::Backend::autocreate(&display.event_loop()).expect("backend");
+    let runtime = wlr::Runtime::new().expect("runtime");
+    runtime.init_graphics(&display, &backend).expect("graphics");
+    runtime.create_xdg_shell(&display, 6).expect("xdg_wm_base");
+    runtime.create_seat(&display, "seat0").expect("seat0");
+    drop(boot);
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut state = State::new(icedtea_config::default_config(), tx);
+    state.wayland.attach(runtime.clone());
+
+    let background = runtime
+        .add_rect(
+            1,
+            1,
+            icedtea_compositor::render::wallpaper_color(&state.config.appearance),
+        )
+        .expect("background rect");
+    runtime.lower_rect_to_bottom(background);
+    state.set_background(background);
+
+    // Bounded backstop: gives both headless outputs time to arrive, enable
+    // (MODE-staging commits), and run at least one frame commit each.
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    state.set_command_receiver(cmd_rx);
+    let (cmd_wake_write, cmd_wake_id) =
+        icedtea_compositor::backend::wake_source(&runtime).expect("cmd wake source");
+    state.set_cmd_wake_source(cmd_wake_id);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = cmd_tx.send(icedtea_compositor::dbus::DbCommand::Quit);
+        icedtea_compositor::backend::wake(&cmd_wake_write);
+    });
+
+    backend
+        .run_all(&display, &mut state, &runtime, wlr::Until::Stop)
+        .expect("run_all");
+
+    assert!(
+        state.quitting,
+        "the backstop Quit command must have stopped the loop"
+    );
+    assert_eq!(
+        state.outputs.len(),
+        2,
+        "both headless outputs must have reached the model"
+    );
+
+    // Every live output committed at least once (enable + frame path), so
+    // each must have a last-commit record.
+    assert_eq!(
+        state.last_commit.len(),
+        state.outputs.len(),
+        "one last-commit record per live output"
+    );
+    for (id, (fields, _when)) in &state.last_commit {
+        assert!(
+            !fields.is_empty(),
+            "the record for {id:?} must carry the staged fields, not an empty mask"
+        );
+    }
+
+    // The boot enable commits stage MODE, which runs the re-derivation
+    // branch: geometries must still be real and disjoint afterwards.
+    let geometries: Vec<_> = state.outputs.values().map(|o| o.geometry).collect();
+    let a = geometries[0];
+    let b = geometries[1];
+    assert!(
+        a.width > 0 && a.height > 0 && b.width > 0 && b.height > 0,
+        "MODE re-derivation must not collapse geometries, got {a:?} and {b:?}"
+    );
+    let disjoint = a.x + a.width <= b.x
+        || b.x + b.width <= a.x
+        || a.y + a.height <= b.y
+        || b.y + b.height <= a.y;
+    assert!(
+        disjoint,
+        "the two outputs' layout boxes must not overlap, got {a:?} and {b:?}"
+    );
+}
 /// Review finding #5 (interactive guard): a client that disables every
 /// connector must NOT be able to drive the compositor to zero active outputs.
 /// An empty `state.outputs` makes `outputs.keys().min()` `None`, so window
